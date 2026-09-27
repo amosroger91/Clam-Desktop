@@ -8,8 +8,9 @@
 //   backoff: 15 min, 30 min, 1 h, 2 h, 4 h, then every 6 h, until success or the user intervenes.
 // - A scan interrupted by quitting, sign-out, or a crash is retried shortly after the app runs again.
 // - A user cancellation clears the pending occurrence; the next regular occurrence still runs.
-// - When both are pending, the full scan runs first. Its success also satisfies a quick occurrence that
-//   was due when it started, because a full scan covers the quick-scan locations.
+// - When both are pending, the full scan runs first. It satisfies a quick occurrence that was due when
+//   it started only when the finished scan's coverage evidence shows the quick-scan locations were
+//   actually inspected (R03); otherwise the quick scan still runs.
 // - Editing a schedule re-plans it from now and clears its pending retry.
 const { nextRun } = require('./core.cjs');
 
@@ -67,9 +68,15 @@ function recordStart(runtime, job, now) {
 }
 
 // Applies a finished job. `status` is a report status, or 'failed-to-start'.
-function recordOutcome(runtime, job, status, now, error = null) {
+// Idempotent per job id, so replaying a scan journal after a crash cannot settle a job twice.
+// `coversQuick` must be backed by coverage evidence from the finished scan (see coverage.cjs).
+function recordOutcome(runtime, job, status, now, error = null, { coversQuick = false } = {}) {
   const r = runtime[job.scheduleId];
   if (!r) return;
+  if (job.id) {
+    if (r.lastJobId === job.id) return;
+    r.lastJobId = job.id;
+  }
   r.lastOutcome = status;
   r.lastOutcomeAt = iso(now);
   // Only occurrences that were due when the job started are settled by it.
@@ -78,7 +85,7 @@ function recordOutcome(runtime, job, status, now, error = null) {
     r.lastSuccess = iso(now);
     if (settles(r.pending)) r.pending = null;
     const quick = runtime.quick;
-    if (job.scheduleId === 'full' && quick && settles(quick.pending)) {
+    if (job.scheduleId === 'full' && coversQuick && quick && settles(quick.pending)) {
       quick.pending = null;
       quick.lastOutcome = 'covered';
       quick.lastOutcomeAt = iso(now);

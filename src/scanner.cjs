@@ -42,6 +42,8 @@ function startScan({
   fs = nodeFs,
   forceKill = () => {},
   onProgress = () => {},
+  // Called synchronously for each detection as it is parsed, so it can be made durable immediately.
+  onThreat = () => {},
   killTimeoutMs = 5000,
   maxLogBytes = 64 * 1024 * 1024
 }) {
@@ -116,7 +118,13 @@ function startScan({
       result.current = parsed.path;
     } else if (parsed.type === 'threat') {
       result.files++;
-      result.threats.push({ path: parsed.path, signature: parsed.signature });
+      const threat = { path: parsed.path, signature: parsed.signature };
+      result.threats.push(threat);
+      try {
+        onThreat(threat);
+      } catch (err) {
+        result.evidenceError ??= err.message;
+      }
     } else if (parsed.type === 'count') result.files = parsed.count;
     else if (parsed.type === 'warning') warn(parsed.message);
     // stderr carries LibClamAV messages; informational lines there are not treated as warnings,

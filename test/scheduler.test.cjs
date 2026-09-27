@@ -10,13 +10,15 @@ const at = (d, h = 0, m = 0) => new Date(2026, 8, d, h, m); // September 2026, l
 const minutes = (a, b) => (new Date(b) - new Date(a)) / 60000;
 
 // Drives the scheduler like the app does: advance, pick a job, start it, and record an outcome.
-function run(cfg, runtime, now, status, error) {
+let jobCounter = 0;
+function run(cfg, runtime, now, status, error, coverage) {
   s.advance(cfg, runtime, now);
   const job = s.nextJob(cfg, runtime, now);
   if (!job) return null;
   job.started = now.toISOString();
+  job.id = 'job-' + ++jobCounter;
   s.recordStart(runtime, job, now);
-  s.recordOutcome(runtime, job, status, now, error);
+  s.recordOutcome(runtime, job, status, now, error, coverage);
   return job;
 }
 
@@ -90,7 +92,7 @@ test('both overdue: the full scan runs first and satisfies the quick occurrence'
   const cfg = config();
   const rt = s.reconcile(cfg, {}, at(20, 13)); // quick next 21 12:00, full next 27 18:00
   const now = at(28, 9); // the PC was off for a week
-  const job = run(cfg, rt, now, 'completed');
+  const job = run(cfg, rt, now, 'completed', null, { coversQuick: true });
   assert.equal(job.scheduleId, 'full');
   assert.equal(rt.full.pending, null);
   assert.equal(rt.quick.pending, null);
@@ -181,4 +183,28 @@ test('upcoming lists a pending retry before the next regular run', () => {
   assert.equal(first.id, 'quick');
   assert.equal(first.retry, true);
   assert.equal(first.at, rt.quick.pending.retryAfter);
+});
+
+test('R03: a full scan without coverage evidence leaves the quick occurrence pending', () => {
+  for (const status of ['partial', 'completed']) {
+    const cfg = config();
+    const rt = s.reconcile(cfg, {}, at(20, 13));
+    const job = run(cfg, rt, at(28, 9), status, null, { coversQuick: false });
+    assert.equal(job.scheduleId, 'full');
+    assert.equal(rt.full.pending, null, 'the full occurrence itself is settled');
+    assert.ok(rt.quick.pending, status + ' full scan must not claim quick coverage without evidence');
+    assert.equal(s.nextJob(cfg, rt, at(28, 9)).scheduleId, 'quick');
+  }
+});
+
+test('R09: recording the same job outcome twice changes nothing', () => {
+  const cfg = config({ enabled: false });
+  const rt = s.reconcile(cfg, {}, at(26));
+  s.advance(cfg, rt, at(27, 18));
+  const job = { ...s.nextJob(cfg, rt, at(27, 18)), started: at(27, 18).toISOString(), id: 'scan-1' };
+  s.recordOutcome(rt, job, 'error', at(27, 19), 'exit 2');
+  const once = structuredClone(rt);
+  s.recordOutcome(rt, job, 'error', at(27, 20), 'exit 2');
+  assert.deepEqual(rt, once);
+  assert.equal(rt.full.pending.attempts, 1);
 });

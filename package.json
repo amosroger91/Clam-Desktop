@@ -13,7 +13,8 @@
     "pack": "electron-builder --win --dir",
     "dist": "electron-builder --win nsis",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "test:smoke": "node scripts/smoke.cjs"
   },
   "devDependencies": {
     "electron": "44.4.5",

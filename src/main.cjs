@@ -8,7 +8,6 @@ const { pathToFileURL } = require('node:url');
 const { validateSettings, scanArgs, parseLine } = require('./core.cjs');
 const { install } = require('./installer.cjs');
 const { createStore } = require('./store.cjs');
-const schemas = require('./schemas.cjs');
 const scheduler = require('./scheduler.cjs');
 const detectionStore = require('./detections.cjs');
 const { createQuarantine } = require('./quarantine.cjs');
@@ -16,15 +15,25 @@ const { startScan, reportStatus } = require('./scanner.cjs');
 const databaseInfo = require('./database.cjs');
 const { assess, capability, classifyUpdateFailure } = require('./health.cjs');
 const { identify } = require('./files.cjs');
+const { createJournal } = require('./journal.cjs');
+const logFiles = require('./logs.cjs');
+const { loadState, applyScan, verifyLinks, SPECS, SAVE_ORDER } = require('./state.cjs');
 
 app.setAppUserModelId('com.wellspring.sentinel');
 // The smoke test module is not packaged, so the flag only works from a source checkout.
-const smoke = !app.isPackaged && process.argv.includes('--smoke-test');
+const smokeArg = process.argv.find(a => a.startsWith('--smoke-test'));
+const smoke = !app.isPackaged && !!smokeArg;
+// '--smoke-test' runs the standard checks; '--smoke-test=crash-start' and '=crash-recover' run a
+// two-launch crash-recovery scenario against the profile named by SENTINEL_SMOKE_PROFILE.
+const smokeMode = smoke ? smokeArg.split('=')[1] || 'standard' : null;
 if (smoke) app.disableHardwareAcceleration();
-if (smoke) app.setPath('userData', path.join(os.tmpdir(), 'sentinel-smoke-' + process.pid));
+if (smoke)
+  app.setPath(
+    'userData',
+    process.env.SENTINEL_SMOKE_PROFILE || path.join(os.tmpdir(), 'sentinel-smoke-' + process.pid)
+  );
 
 const HOUR = 3600000;
-const MAX_REPORTS = 200;
 const UPDATE_TIMEOUT = 20 * 60000;
 const SHUTDOWN_TIMEOUT = 10000;
 
@@ -34,10 +43,12 @@ if (!app.requestSingleInstanceLock()) {
   const root = app.getPath('userData');
   const db = path.join(root, 'database');
   const logs = path.join(root, 'logs');
+  const { scans: scanLogs, app: appLogs } = logFiles.layout(logs);
   const vault = path.join(root, 'quarantine');
   const page = pathToFileURL(path.join(__dirname, '../ui/index.html')).href;
   const icon = path.join(__dirname, '../assets/icon.png');
   const store = createStore(root);
+  const journal = createJournal(path.join(root, 'journal'));
 
   // ---- State ----
   // Persisted
@@ -70,15 +81,6 @@ if (!app.requestSingleInstanceLock()) {
   const dialogParent = () => withWindow(w => w) || undefined;
 
   // ---- Persistence ----
-  const SPECS = {
-    settings: schemas.settings,
-    history: schemas.reports,
-    detections: schemas.detections,
-    quarantine: schemas.quarantine,
-    updates: schemas.updates,
-    schedule: schemas.schedule,
-    jobs: schemas.jobs
-  };
   const current = {
     settings: () => settings,
     history: () => reports,
@@ -91,6 +93,12 @@ if (!app.requestSingleInstanceLock()) {
   function persist(...names) {
     for (const name of names) store.save(name, current[name](), SPECS[name].version);
   }
+  const persistAll = () => persist(...SAVE_ORDER);
+  // Storage problems are shown once each (R13), not appended on every retry.
+  function addStorageIssue(issue) {
+    if (storageIssues.some(i => i.file === issue.file && i.message === issue.message)) return;
+    storageIssues = [...storageIssues, issue].slice(-20);
+  }
   // For saves after work already happened: the failure is surfaced, but cleanup and the original
   // outcome are never lost because of it.
   function persistQuietly(...names) {
@@ -98,75 +106,109 @@ if (!app.requestSingleInstanceLock()) {
       persist(...names);
       return true;
     } catch (err) {
-      storageIssues.push({ file: err.file ? path.basename(err.file) : names.join(', '), message: err.message });
+      addStorageIssue({ file: err.file ? path.basename(err.file) : names.join(', '), message: err.message });
       notify('Sentinel could not save its data', err.message, 'storage');
       return false;
     }
   }
 
-  function loadAll() {
-    const now = new Date();
-    const load = name => {
-      const result = store.load(name, SPECS[name]);
-      if (result.issue) storageIssues.push(result.issue);
-      return result;
-    };
-    const exists = name => fs.existsSync(store.file(name));
-    const hadDetections = exists('detections'),
-      hadSchedule = exists('schedule');
-    const s = load('settings');
-    settings = s.value;
-    const h = load('history');
-    reports = h.value;
-    detections = load('detections').value;
-    // Version 1.0 kept detection status inside scan reports; build the independent store once.
-    if (!hadDetections && h.legacy) {
-      const migrated = detectionStore.migrateLegacy(h.legacy, now.toISOString());
-      detections = migrated.detections;
-      for (const r of reports) for (const t of r.threats) t.detectionId = migrated.idMap[t.id] ?? t.detectionId;
-    }
-    quarantineRecords = load('quarantine').value;
-    updates = load('updates').value;
-    let runtime = load('schedule').value;
-    if (!hadSchedule && Array.isArray(s.legacy?.schedules))
-      runtime = Object.fromEntries(s.legacy.schedules.filter(x => x?.next).map(x => [x.id, { next: x.next }]));
-    scheduleRuntime = scheduler.reconcile(settings.schedules, runtime, now);
-    jobs = load('jobs').value;
-    // Never scan the signature store or the quarantine itself.
-    settings.exclusions = [...new Set([...settings.exclusions, root])];
-    persistQuietly(...Object.keys(SPECS));
+  // Mutable view of the state for the transaction helpers in state.cjs.
+  const stateView = () => ({
+    settings,
+    reports,
+    detections,
+    quarantine: quarantineRecords,
+    updates,
+    scheduleRuntime,
+    jobs
+  });
+  function adopt(view) {
+    reports = view.reports;
+    detections = view.detections;
   }
 
-  // A scan that was running when Sentinel stopped unexpectedly is recorded as interrupted, keeping any
-  // detections it had already written to its log. Its scheduled occurrence is retried.
-  function recoverInterruptedScan() {
+  function loadAll() {
+    const now = new Date();
+    const { state: loaded, issues } = loadState(store, { now, dataRoot: root });
+    issues.forEach(addStorageIssue);
+    ({ settings, reports, detections, updates, scheduleRuntime, jobs } = loaded);
+    quarantineRecords = loaded.quarantine;
+    const view = stateView();
+    const links = verifyLinks(view);
+    adopt(view);
+    if (links.repaired)
+      addStorageIssue({
+        file: 'detections',
+        message: `${links.repaired} detection link(s) were missing and were reopened for review.`
+      });
+    for (const message of links.ambiguous) addStorageIssue({ file: 'quarantine', message });
+    persistQuietly(...SAVE_ORDER);
+  }
+
+  // Applies every scan journal left behind by a crash or failed save. Idempotent, so a crash during this
+  // recovery is repaired by running it again. A journal is deleted only after the stores are saved.
+  function recoverJournals() {
+    const now = new Date();
+    for (const id of journal.list()) {
+      let replay;
+      try {
+        replay = journal.read(id);
+      } catch (err) {
+        addStorageIssue({ file: 'journal', message: 'A scan journal could not be read: ' + err.message });
+        continue;
+      }
+      if (!replay.header) {
+        journal.remove(id); // torn before the scan was acknowledged
+        continue;
+      }
+      const view = stateView();
+      applyScan(view, replay, now);
+      adopt(view);
+      if (persistQuietly(...SAVE_ORDER)) journal.remove(id);
+    }
+    recoverLegacyRunningScan(now);
+  }
+
+  // Version 1.1.0 marked a running scan in jobs.json and relied on its log. Convert such a marker into a
+  // journal replay; the log is read with a hard size bound (R13).
+  function recoverLegacyRunningScan(now) {
     const job = jobs.current;
     if (!job) return;
-    const now = new Date();
-    const report = {
-      id: job.reportId,
-      kind: job.kind,
-      scheduled: !!job.scheduleId,
-      started: job.started,
-      finished: now.toISOString(),
-      status: 'interrupted',
-      files: 0,
-      threats: [],
-      warnings: ['Sentinel stopped before this scan finished. Results below are from the part that completed.'],
-      targets: job.targets || []
-    };
+    const detectionsFromLog = [];
+    let files = 0;
     try {
-      const text = fs.readFileSync(path.join(logs, job.reportId + '.log'), 'utf8').slice(0, 64 * 1048576);
-      for (const line of text.split(/\r?\n/)) {
-        const parsed = parseLine(line.trim());
-        if (parsed.type === 'file') report.files++;
-        if (parsed.type === 'threat') addThreat(report, parsed, now);
+      const fd = fs.openSync(path.join(scanLogs, job.reportId + '.log'), 'r');
+      try {
+        const size = Math.min(fs.fstatSync(fd).size, 64 * 1048576);
+        const buffer = Buffer.alloc(size);
+        fs.readSync(fd, buffer, 0, size, 0);
+        buffer
+          .toString('utf8')
+          .split(/\r?\n/)
+          .forEach((line, index) => {
+            const parsed = parseLine(line.trim());
+            if (parsed.type === 'file') files++;
+            if (parsed.type === 'threat')
+              detectionsFromLog.push({
+                eventId: `${job.reportId}-${index}`,
+                path: parsed.path,
+                signature: parsed.signature,
+                at: now.toISOString()
+              });
+          });
+      } finally {
+        fs.closeSync(fd);
       }
     } catch {}
-    if (!reports.some(r => r.id === report.id)) reports.unshift(report);
-    if (job.scheduleId) scheduler.recordOutcome(scheduleRuntime, job, 'interrupted', now);
+    const view = stateView();
+    applyScan(
+      view,
+      { header: job, targets: job.targets || [], detections: detectionsFromLog, progress: { files }, commit: null },
+      now
+    );
+    adopt(view);
     jobs.current = null;
-    persistQuietly('history', 'detections', 'schedule', 'jobs');
+    persistQuietly(...SAVE_ORDER);
   }
 
   // ---- Publishing state ----
@@ -506,23 +548,8 @@ if (!app.requestSingleInstanceLock()) {
     return drives;
   }
 
-  function addThreat(report, found, now) {
-    const d = detectionStore.observe(detections, {
-      path: found.path,
-      signature: found.signature,
-      reportId: report.id,
-      at: now.toISOString()
-    });
-    report.threats.push({ id: crypto.randomUUID(), path: found.path, signature: found.signature, detectionId: d.id });
-  }
-
   function pruneLogs() {
-    const keep = new Set(reports.map(h => h.id + '.log'));
-    if (active) keep.add(active.id + '.log');
-    try {
-      for (const name of fs.readdirSync(logs))
-        if (name.endsWith('.log') && !keep.has(name)) fs.rmSync(path.join(logs, name), { force: true });
-    } catch {}
+    logFiles.pruneScanLogs(scanLogs, [...reports.map(r => r.id), ...(active ? [active.id] : [])]);
   }
 
   // Starts a scan and returns once it is running (or has failed to start). The result is recorded when
@@ -555,20 +582,19 @@ if (!app.requestSingleInstanceLock()) {
         exclusions: settings.exclusions.length
       }
     };
-    // Journal the scan before starting anything, so a crash can be recovered.
-    jobs.current = {
+    // The scan's journal is its durable record. No journal, no scan: a scan must never run untracked.
+    const header = {
       reportId: report.id,
       kind,
       scheduleId: job?.scheduleId ?? null,
       occurrence: job?.occurrence ?? null,
-      started: report.started
+      started: report.started,
+      engineVersion: report.engineVersion,
+      databaseVersion: report.databaseVersion,
+      options: report.options
     };
-    try {
-      persist('jobs');
-    } catch (err) {
-      jobs.current = null;
-      throw err;
-    }
+    const writer = journal.begin(report.id, header);
+    const evidence = { writer, header, targets: [], detections: [], failure: null };
     active = report;
     const control = { abort: new AbortController(), cancelReason: null };
     let finished;
@@ -576,7 +602,8 @@ if (!app.requestSingleInstanceLock()) {
     publish(true);
 
     const complete = result => {
-      finishScan(report, result, job);
+      clearInterval(progressTimer);
+      finishScan(report, result, evidence);
       finished();
     };
     let targets;
@@ -598,21 +625,51 @@ if (!app.requestSingleInstanceLock()) {
       err.recorded = true; // finishScan already recorded the outcome
       throw err;
     }
-    report.targets = jobs.current.targets = targets;
-    persistQuietly('jobs');
-    const handle = startScan({
+    report.targets = evidence.targets = targets;
+    try {
+      writer.append('targets', { targets });
+    } catch (err) {
+      evidence.failure = err.message;
+    }
+    // Periodic progress lets an interrupted report keep a meaningful file count.
+    const progressTimer = setInterval(() => {
+      try {
+        writer.append('progress', { files: report.files });
+      } catch {}
+    }, 30000);
+    let handle;
+    handle = startScan({
       exe: path.join(engine.dir, 'clamscan.exe'),
       args: scanArgs(settings, db, targets),
-      logPath: path.join(logs, report.id + '.log'),
+      logPath: path.join(scanLogs, report.id + '.log'),
       spawn,
       forceKill,
+      // A detection is acknowledged only once it is durable. If evidence cannot be recorded, the scan
+      // stops rather than continuing to find things it cannot keep (R06).
+      onThreat: threat => {
+        const event = {
+          eventId: crypto.randomUUID(),
+          path: threat.path,
+          signature: threat.signature,
+          at: new Date().toISOString()
+        };
+        try {
+          writer.append('detection', event);
+          evidence.detections.push(event);
+          report.threatCount = evidence.detections.length;
+          // Smoke crash scenario: die abruptly once evidence is durable, before the scan can commit.
+          if (smokeMode === 'crash-start') process.exit(0);
+        } catch (err) {
+          evidence.failure ??= err.message;
+          handle?.cancel('evidence');
+        }
+      },
       onProgress: snapshot => {
         Object.assign(report, {
           phase: snapshot.phase,
           current: snapshot.current,
           files: snapshot.files,
-          warningCount: snapshot.warningCount,
-          threatCount: snapshot.threats.length
+          warningCount: snapshot.warningCount
         });
         publish();
       }
@@ -625,56 +682,70 @@ if (!app.requestSingleInstanceLock()) {
     return report.id;
   }
 
-  function finishScan(report, result, job) {
+  // Commits the scan: write the outcome to the journal, apply the journal's contents to the stores in one
+  // idempotent transaction, save, and only then delete the journal (R09). A failure at any point leaves
+  // the journal for startup recovery, which converges on the same result.
+  function finishScan(report, result, evidence) {
     const now = new Date();
-    let status = 'error';
+    let applied = report;
     try {
-      status = reportStatus(result);
-      Object.assign(report, {
+      let status = reportStatus(result);
+      let error = result.error || null;
+      if (result.cancelReason === 'evidence') {
+        status = 'error';
+        error = 'The scan was stopped because detections could not be saved: ' + evidence.failure;
+        addStorageIssue({ file: 'journal', message: error });
+      }
+      const outcome = {
+        status,
         finished: now.toISOString(),
         exitCode: result.exitCode,
-        status,
         files: result.files,
-        warnings: result.warnings,
+        warnings: error && !result.warnings.includes(error) ? [error, ...result.warnings] : result.warnings,
         warningCount: result.warningCount,
-        logTruncated: !!result.logTruncated
-      });
-      delete report.phase;
-      delete report.current;
-      delete report.threatCount;
-      for (const t of result.threats) addThreat(report, t, now);
+        logTruncated: !!result.logTruncated,
+        logError: result.logError || null,
+        error,
+        coversQuick: false
+      };
+      try {
+        evidence.writer.append('commit', { outcome });
+      } catch (err) {
+        evidence.failure ??= err.message;
+      }
+      evidence.writer.close();
       if (result.databaseError) recordDatabaseLoad(true);
       else if (status === 'completed' || status === 'partial') recordDatabaseLoad(false);
-      reports.unshift(report);
-      reports = reports.slice(0, MAX_REPORTS);
-      detections = detectionStore.prune(detections);
-      if (job?.scheduleId) scheduler.recordOutcome(scheduleRuntime, job, status, now, result.error || null);
-      if (status === 'completed' || status === 'partial')
-        jobs.lastSuccessfulScan = {
-          id: report.id,
-          kind: report.kind,
-          finished: report.finished,
-          status,
-          files: report.files
-        };
-      jobs.current = null;
+      const view = stateView();
+      applied = applyScan(
+        view,
+        {
+          header: evidence.header,
+          targets: evidence.targets,
+          detections: evidence.detections,
+          progress: { files: result.files },
+          commit: outcome
+        },
+        now
+      );
+      adopt(view);
     } finally {
       // Cleanup happens even if recording the result failed.
       active = null;
       activeScan = null;
-      persistQuietly('history', 'detections', 'schedule', 'jobs', 'updates');
+      if (persistQuietly(...SAVE_ORDER)) journal.remove(report.id);
       withWindow(w => w.setProgressBar(-1));
       publish(true);
       setImmediate(pruneLogs);
     }
-    if (status !== 'interrupted')
+    if (applied.status !== 'interrupted')
       notify(
-        'Sentinel scan ' + status,
-        report.threats.length
-          ? report.threats.length + ' detection(s) need review.'
-          : report.files.toLocaleString() +
+        'Sentinel scan ' + applied.status,
+        applied.threats.length
+          ? applied.threats.length + ' detection(s) need review.'
+          : applied.files.toLocaleString() +
               ' files scanned. ' +
-              (status === 'completed' ? 'No threats detected.' : 'Review the scan report.')
+              (applied.status === 'completed' ? 'No threats detected.' : 'Review the scan report.')
       );
     identifyDetections();
   }
@@ -947,10 +1018,11 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', show);
   app.whenReady().then(async () => {
     [root, db, logs, vault].forEach(p => fs.mkdirSync(p, { recursive: true }));
+    logFiles.migrateLayout(logs);
     const firstRun = !fs.existsSync(store.file('settings'));
     loadAll();
     quarantine = createQuarantineManager();
-    recoverInterruptedScan();
+    recoverJournals();
     pruneLogs();
     if (firstRun && app.isPackaged && !smoke) {
       settings.launchAtLogin = true;
@@ -1135,6 +1207,7 @@ if (!app.requestSingleInstanceLock()) {
     tick();
     if (smoke)
       require('./smoke.cjs')(win, {
+        mode: smokeMode,
         win,
         db,
         detectEngine,
@@ -1146,7 +1219,13 @@ if (!app.requestSingleInstanceLock()) {
         },
         isScanning: () => !!active,
         latestReport: () => reports[0],
-        quit: () => app.quit()
+        // Electron's app.quit() ignores process.exitCode, so the result is passed to app.exit() explicitly
+        // after the normal shutdown path has run.
+        quit: code =>
+          shutdown().finally(() => {
+            shutdownComplete = true;
+            app.exit(code);
+          })
       });
   });
 
