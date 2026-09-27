@@ -1,0 +1,24 @@
+{
+  "name": "sentinel-av",
+  "version": "1.0.0",
+  "description": "A considered Windows desktop companion for ClamAV",
+  "author": "WellSpring Studio",
+  "license": "MIT",
+  "private": true,
+  "main": "src/main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs",
+    "pack": "electron-builder --win --dir",
+    "dist": "electron-builder --win nsis"
+  },
+  "devDependencies": { "electron": "44.4.5", "electron-builder": "26.15.3" },
+  "build": {
+    "appId": "com.wellspring.sentinel",
+    "productName": "Sentinel AV",
+    "directories": { "output": "release" },
+    "files": ["src/**/*", "ui/**/*", "assets/**/*", "package.json"],
+    "win": { "target": "nsis", "icon": "assets/icon.ico", "signExecutable": false },
+    "nsis": { "oneClick": false, "perMachine": false, "allowToChangeInstallationDirectory": true, "createDesktopShortcut": true, "createStartMenuShortcut": true }
+  }
+}
