@@ -12,16 +12,19 @@ function selectAsset(release, arch) {
     throw Error('Untrusted engine download location.');
   return asset;
 }
-async function install(root, progress) {
+// `signal` cancels the download or extraction; partial files are removed either way.
+async function install(root, progress, signal = new AbortController().signal) {
   const response = await fetch('https://api.github.com/repos/Cisco-Talos/clamav/releases/latest', {
     headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Sentinel-AV' },
-    signal: AbortSignal.timeout(30000)
+    signal: AbortSignal.any([signal, AbortSignal.timeout(30000)])
   });
   if (!response.ok) throw Error('Could not check ClamAV releases: HTTP ' + response.status);
   const release = await response.json();
   const asset = selectAsset(release, process.arch);
   progress('Downloading ' + asset.name + ' from Cisco Talos…');
-  const download = await fetch(asset.browser_download_url, { signal: AbortSignal.timeout(900000) });
+  const download = await fetch(asset.browser_download_url, {
+    signal: AbortSignal.any([signal, AbortSignal.timeout(900000)])
+  });
   if (!download.ok || !download.body) throw Error('Engine download failed: HTTP ' + download.status);
   const archive = path.join(root, 'engine-download.zip');
   const handle = await fs.promises.open(archive, 'w');
@@ -29,6 +32,7 @@ async function install(root, progress) {
   let received = 0,
     last = 0;
   try {
+    signal.throwIfAborted();
     for await (const chunk of download.body) {
       hash.update(chunk);
       await handle.writeFile(chunk);
@@ -44,9 +48,12 @@ async function install(root, progress) {
         );
       }
     }
-  } finally {
+  } catch (err) {
     await handle.close();
+    fs.rmSync(archive, { force: true });
+    throw err;
   }
+  await handle.close();
   const destination = path.join(root, 'engine-' + crypto.randomUUID());
   try {
     if (received !== asset.size || hash.digest('hex') !== asset.digest.slice(7))
@@ -63,7 +70,7 @@ async function install(root, progress) {
       execFile(
         'powershell.exe',
         ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
-        { windowsHide: true, timeout: 300000 },
+        { windowsHide: true, timeout: 300000, signal },
         err => (err ? reject(err) : resolve())
       )
     );

@@ -14,10 +14,14 @@ test('weekly schedule uses the next local weekday', () => {
   assert.equal(next.getMonth(), 9);
   assert.equal(next.getDate(), 4);
 });
-test('preferences preserve an overdue schedule until it runs', () => {
+test('saved preferences contain configuration only and validate the freshness threshold', () => {
   const original = defaults();
-  original.schedules[0].next = '2020-01-01T12:00:00Z';
-  assert.equal(validateSettings(structuredClone(original), original).schedules[0].next, original.schedules[0].next);
+  const input = { ...structuredClone(original), engineDir: 'C:\\injected' };
+  input.schedules[0].next = '2020-01-01T12:00:00Z';
+  const saved = validateSettings(input, original);
+  assert.equal(saved.schedules[0].next, undefined);
+  assert.equal(saved.engineDir, original.engineDir);
+  assert.throws(() => validateSettings({ ...input, staleAfterDays: 0 }, original), /1–30/);
 });
 test('invalid settings cannot smuggle arguments or malformed schedule values', () => {
   const original = defaults();
@@ -36,6 +40,8 @@ test('scan arguments use literal target paths and escape excluded folder regexes
   assert.ok(regex.test('C:\\Users\\A (test)\\vault\\file.exe'));
   assert.ok(!regex.test('C:\\Users\\A (test)\\vault-other\\file.exe'));
   assert.ok(!args.some(a => a.startsWith('--remove')));
+  for (const target of ['--remove=yes', 'relative\folder', '/C'])
+    assert.throws(() => scanArgs(s, 'C:\database', [target]), /Invalid scan location/);
 });
 test('scan output handles Windows drive colons and detection names', () => {
   assert.deepEqual(parseLine('C:\\Users\\test.txt: Win.Test.Signature FOUND'), {

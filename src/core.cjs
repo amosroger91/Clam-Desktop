@@ -1,4 +1,3 @@
-const fs = require('node:fs');
 const path = require('node:path');
 
 function nextRun(schedule, after = new Date()) {
@@ -20,11 +19,14 @@ function defaults() {
     autoUpdate: true,
     scanArchives: true,
     detectPUA: false,
+    // Definitions older than this are reported as outdated.
+    staleAfterDays: 3,
     exclusions: [],
+    // Schedule configuration only; next-run and retry state is kept by the scheduler (schedule.json).
     schedules: [
       { id: 'quick', enabled: true, frequency: 'daily', time: '12:00', day: 0 },
       { id: 'full', enabled: true, frequency: 'weekly', time: '18:00', day: 0 }
-    ].map(s => ({ ...s, next: nextRun(s) }))
+    ]
   };
 }
 function validateSettings(input, previous) {
@@ -46,14 +48,17 @@ function validateSettings(input, previous) {
       s.day > 6
     )
       throw Error('Invalid schedule.');
-    const clean = { id, enabled: s.enabled, frequency: s.frequency, time: s.time, day: s.day };
-    const old = previous.schedules.find(s => s.id === id);
-    clean.next = ['enabled', 'frequency', 'time', 'day'].every(k => old[k] === clean[k]) ? old.next : nextRun(clean);
-    return clean;
+    return { id, enabled: s.enabled, frequency: s.frequency, time: s.time, day: s.day };
   });
+  if (!Number.isInteger(input.staleAfterDays) || input.staleAfterDays < 1 || input.staleAfterDays > 30)
+    throw Error('Choose how many days definitions stay current (1–30).');
+  out.staleAfterDays = input.staleAfterDays;
   return out;
 }
 function scanArgs(settings, database, targets) {
+  // Targets come from native pickers or known folders. Requiring absolute paths also guarantees that no
+  // target can be mistaken for a command-line option.
+  for (const t of targets) if (!path.win32.isAbsolute(t) || /^[-/]/.test(t)) throw Error('Invalid scan location: ' + t);
   return [
     '--recursive=yes',
     '--verbose',
@@ -77,9 +82,4 @@ function parseLine(line) {
     return { type: 'warning', message: line };
   return { type: 'info', message: line };
 }
-function saveJson(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file + '.tmp', JSON.stringify(data, null, 2));
-  fs.renameSync(file + '.tmp', file);
-}
-module.exports = { nextRun, defaults, validateSettings, scanArgs, parseLine, saveJson };
+module.exports = { nextRun, defaults, validateSettings, scanArgs, parseLine };

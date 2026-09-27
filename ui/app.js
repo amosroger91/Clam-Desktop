@@ -1,5 +1,6 @@
 const icons = {
   shield: '<path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6Z"/><path d="m8 12 3 3 5-6"/>',
+  alert: '<path d="M12 3 4 6v6c0 5 8 9 8 9s8-4 8-9V6Z"/><path d="M12 8v5m0 3h.01"/>',
   grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   scan: '<path d="M8 3H3v5m13-5h5v5M3 16v5h5m8 0h5v-5M3 12h18"/><circle cx="12" cy="12" r="5"/>',
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
@@ -25,6 +26,8 @@ const date = value =>
   value
     ? new Date(value).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
     : 'Not yet';
+// Health details carry ISO times from the main process; show them in the user's locale.
+const localize = text => String(text ?? '').replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, iso => date(iso));
 const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const labels = { quick: 'Quick scan', full: 'Full scan', custom: 'Custom scan' };
 const views = [
@@ -38,7 +41,8 @@ const views = [
 let state,
   current = 'overview',
   draft,
-  toastTimer;
+  toastTimer,
+  stale = false;
 // Actions currently awaiting the main process, keyed by action and value. The main process
 // already rejects conflicting operations, so unrelated actions stay usable during long updates.
 const pending = new Set();
@@ -74,19 +78,39 @@ function toggle(key, title, description) {
       <input class="toggle" type="checkbox" aria-label="${title}" data-setting="${key}" ${draft[key] ? 'checked' : ''}>
     </div>`;
 }
+function facts(items) {
+  return `<div class="facts">${items.map(([k, v]) => `<div>${k}<strong>${v}</strong></div>`).join('')}</div>`;
+}
 function scheduleText(s) {
   return `${s.frequency === 'daily' ? 'Every day' : 'Every ' + days[s.day]} at ${s.time}`;
 }
 const busyEngine = () => !!state.active || state.updating || !!state.installing;
+const unresolved = () => state.detections.filter(d => d.status === 'detected' || d.status === 'missing');
+const detectionById = id => state.detections.find(d => d.id === id);
+const statusTone = { ok: '', off: 'amber', warn: 'amber', error: 'red' };
+const healthPill = {
+  ok: ['ALL CHECKS PASSED', ''],
+  attention: ['NEEDS ATTENTION', 'amber'],
+  problem: ['ACTION NEEDED', 'red'],
+  setup: ['SETUP REQUIRED', 'amber']
+};
 
 // ---- Live values ----
 // Elements marked data-live are updated in place by progress events, so the page is not
 // rebuilt while a scan or update streams output (which would reset focus and selection).
 
+const phaseText = {
+  preparing: 'Finding scan locations',
+  loading: 'Loading signatures',
+  scanning: 'Scanning',
+  cancelling: 'Stopping'
+};
 const live = {
   files: () => (state.active ? state.active.files.toLocaleString() + ' files checked' : ''),
   counts: () =>
-    state.active ? `${state.active.threats.length} detections · ${state.active.warnings.length} warnings` : '',
+    state.active ? `${state.active.threatCount ?? 0} detections · ${state.active.warningCount ?? 0} warnings` : '',
+  phase: () =>
+    state.active ? phaseText[state.active.status === 'cancelling' ? 'cancelling' : state.active.phase] || '' : '',
   current: () => state.active?.current ?? '',
   installOutput: () => state.installOutput || 'Starting…',
   updateOutput: () => state.updateOutput
@@ -106,7 +130,7 @@ function scans() {
     ['full', 'monitor', 'THOROUGH CHECK', 'Scan all local fixed drives for a comprehensive review.'],
     ['custom', 'folder', 'YOUR CHOICE', 'Choose a specific folder and scan everything inside it.']
   ];
-  const disabled = busyEngine() || !state.engine.ready;
+  const disabled = busyEngine() || !state.engine.runnable;
   return `<div class="scan-grid">${cards
     .map(([kind, image, tag, desc]) => {
       const tone = kind === 'quick' ? 'green' : kind === 'custom' ? 'purple' : '';
@@ -132,7 +156,7 @@ function activeScan() {
   return `
     <section class="card panel scan-progress">
       <div class="row spread">
-        <div><div class="eyebrow">SCAN IN PROGRESS</div><h2>${labels[a.kind]} ${a.scheduled ? '· scheduled' : ''}</h2></div>
+        <div><div class="eyebrow">SCAN IN PROGRESS · <span data-live="phase">${esc(live.phase())}</span></div><h2>${labels[a.kind]} ${a.scheduled ? '· scheduled' : ''}</h2></div>
         ${btn('Stop scan', 'cancel', '', 'small danger', a.status === 'cancelling')}
       </div>
       <div class="progress-track"><i></i></div>
@@ -141,40 +165,51 @@ function activeScan() {
         <span class="muted" data-live="counts">${esc(live.counts())}</span>
       </div>
       <p class="path" data-live="current">${esc(live.current())}</p>
-      <p>Scanning time depends on file count and size. A percentage is not available.</p>
+      <p>Started ${date(a.started)}. Scanning time depends on file count and size, so no percentage is shown.</p>
     </section>`;
 }
 
+function healthChecks() {
+  const actionFor = check => {
+    if (!check.action || check.status === 'ok') return '';
+    if (check.action === 'update')
+      return btn('Update now', 'update', '', 'small', busyEngine() || !state.engine.installed, 'refresh');
+    return btn('Review', 'navigate', check.action, 'small');
+  };
+  return `<div class="checks">${state.health.checks
+    .map(
+      c => `
+        <div class="check">
+          <span class="dot ${c.status}" aria-hidden="true"></span>
+          <div><strong>${esc(c.label)}</strong>${c.detail ? `<p>${esc(localize(c.detail))}</p>` : ''}</div>
+          <span class="sr-only">${c.status === 'ok' ? 'OK' : c.status === 'off' ? 'Off' : c.status === 'warn' ? 'Warning' : 'Problem'}</span>
+          ${actionFor(c)}
+        </div>`
+    )
+    .join('')}</div>`;
+}
+
 function overview() {
-  const ready = state.engine.ready;
-  const last = state.history[0];
-  const unresolved = state.history.flatMap(h => h.threats).filter(t => t.status === 'detected').length;
-  const title = !ready
-    ? 'A safer routine starts here.'
-    : unresolved
-      ? 'A few files need your attention.'
-      : state.active
-        ? 'Taking a closer look.'
-        : 'Your next scan is covered.';
-  const sub = !ready
-    ? 'Set up the ClamAV engine, then let Sentinel take care of your daily and weekly scans.'
-    : unresolved
-      ? 'Review the detections from your scans and decide what to quarantine.'
-      : 'A little peace of mind, on your schedule. Your scans and signature updates are managed here.';
-  const status = pill(
-    !ready ? 'SETUP REQUIRED' : unresolved ? 'REVIEW DETECTIONS' : 'SCHEDULED SCANNING',
-    !ready || unresolved ? 'amber' : ''
-  );
-  const action = !ready
-    ? btn('Set up protection', 'navigate', 'settings', 'primary', false, 'arrow')
-    : unresolved
-      ? btn('Review activity', 'navigate', 'activity', 'primary')
-      : btn('Run quick scan', 'scan', 'quick', 'primary', !!state.active || state.updating, 'scan');
+  const h = state.health;
+  const [pillText, pillTone] = healthPill[h.state];
+  const sub = {
+    ok: 'Your schedule is enabled, definitions are current and verified, and your last scan completed.',
+    attention: 'Sentinel is working, but something below needs a look.',
+    problem: 'Something below needs your action.',
+    setup: 'Set up the ClamAV engine and its signature database, then Sentinel can run your scheduled scans.'
+  }[h.state];
+  const firstAction = h.checks.find(c => c.status !== 'ok' && c.action);
+  const action =
+    h.state === 'setup'
+      ? btn('Set up protection', 'navigate', 'settings', 'primary', false, 'arrow')
+      : firstAction && firstAction.action !== 'update'
+        ? btn('Review', 'navigate', firstAction.action, 'primary', false, 'arrow')
+        : btn('Run quick scan', 'scan', 'quick', 'primary', busyEngine() || !state.engine.runnable, 'scan');
 
   const hero = `
-    <section class="hero">
-      <div class="hero-mark">${icon('shield')}</div>
-      <div class="hero-copy">${status}<h2>${title}</h2><p>${sub}</p></div>
+    <section class="hero ${h.state}">
+      <div class="hero-mark">${icon(h.state === 'ok' ? 'shield' : 'alert')}</div>
+      <div class="hero-copy">${pill(pillText, pillTone)}<h2>${esc(h.headline)}</h2><p>${sub}</p></div>
       <div class="hero-actions">${action}<small>Powered by open-source ClamAV</small></div>
     </section>`;
 
@@ -183,27 +218,38 @@ function overview() {
       <div class="icon-box ${tone}">${icon(image)}</div>
       <div><div class="caption">${caption}</div><strong>${value}</strong><small>${detail}</small></div>
     </div>`;
+  const db = state.database;
+  const last = h.lastSuccessfulScan;
+  const next = h.nextScan;
   const metrics = `<div class="metrics">${
     metric(
       'green',
-      'shield',
-      'SCAN ENGINE',
-      ready ? 'Ready to scan' : 'Setup needed',
-      state.engine.available ? esc(state.engine.version.split('/')[0]) : 'ClamAV is not installed'
+      'clock',
+      'NEXT SCHEDULED SCAN',
+      next ? date(next.at) : 'Paused',
+      next ? labels[next.id] + (next.retry ? ' · retry' : '') : 'No schedule is enabled'
     ) +
     metric(
       '',
-      'clock',
-      'LAST SCAN',
-      last ? date(last.finished) : 'No scans yet',
-      last ? labels[last.kind] + ' · ' + last.status : 'Your first scan is a fresh start'
+      'check',
+      'LAST SUCCESSFUL SCAN',
+      last ? date(last.finished) : 'None yet',
+      last ? `${labels[last.kind]} · ${last.files.toLocaleString()} files` : 'Run a scan to establish a baseline'
     ) +
     metric(
       'purple',
       'refresh',
-      'SIGNATURE DATABASE',
-      state.updating ? 'Updating…' : state.lastUpdate ? 'Downloaded' : 'Not downloaded',
-      state.lastUpdate ? 'Updated ' + date(state.lastUpdate) : 'Latest definitions on setup'
+      'DEFINITIONS',
+      state.updating
+        ? 'Updating…'
+        : db.buildTime
+          ? 'Built ' + date(db.buildTime)
+          : db.present
+            ? 'Date unknown'
+            : 'Not downloaded',
+      db.version
+        ? `Version ${db.version} · ${db.verified === true ? 'verified' : db.verified === false ? 'failed verification' : 'not yet verified'}`
+        : 'Downloaded during setup'
     )
   }</div>`;
 
@@ -213,48 +259,39 @@ function overview() {
         <div class="schedule-mini">
           <div class="icon-box">${icon(s.id === 'quick' ? 'bolt' : 'monitor')}</div>
           <div><strong>${labels[s.id]}</strong><p>${scheduleText(s)}</p></div>
-          ${pill(s.enabled ? 'Scheduled' : 'Paused', s.enabled ? '' : 'neutral')}
+          ${pill(s.enabled ? (state.schedule.runtime[s.id]?.pending?.attempts ? 'Retrying' : 'Scheduled') : 'Paused', s.enabled ? (state.schedule.runtime[s.id]?.pending?.attempts ? 'amber' : '') : 'neutral')}
         </div>`
     )
     .join('');
-  const recent = `
-    <div class="empty">
-      ${icon(last ? 'check' : 'activity')}
-      <div>
-        <strong>${last ? labels[last.kind] + ' ' + last.status : 'A clean slate'}</strong>
-        <p>${last ? last.files.toLocaleString() + ' files checked · ' + last.threats.length + ' detections' : 'Completed scans and detections will appear here.'}</p>
-      </div>
-    </div>`;
 
   return (
     heading(
       'Security overview',
-      'A clear view of your device. A little more peace of mind.',
+      'What Sentinel has verified about this device, and what needs attention.',
       pill('WINDOWS DESKTOP', 'neutral')
     ) +
     hero +
     activeScan() +
     metrics +
-    `<div class="section-title"><h2>Make a scan your own</h2><span>Three ways to check your device</span></div>` +
-    scans() +
     `<div class="bottom-grid">
+      <section class="card panel">
+        <div class="panel-top"><h2>Health checks</h2><span class="muted">Scheduled and on-demand scanning. Real-time file monitoring is not included.</span></div>
+        ${healthChecks()}
+      </section>
       <section class="card panel">
         <div class="panel-top"><h2>Your scan routine</h2><button class="link" data-action="navigate" data-value="schedules">Manage schedule →</button></div>
         ${routine}
       </section>
-      <section class="card panel">
-        <div class="panel-top"><h2>Recent activity</h2><button class="link" data-action="navigate" data-value="activity">View all →</button></div>
-        ${recent}
-        <p>Scheduled and on-demand scanning. Real-time file monitoring is not included.</p>
-      </section>
-    </div>`
+    </div>` +
+    `<div class="section-title"><h2>Make a scan your own</h2><span>Three ways to check your device</span></div>` +
+    scans()
   );
 }
 
 function scanCenter() {
   return (
     heading('Scan center', 'A quick check or a closer look. You’re in control.') +
-    (!state.engine.ready
+    (!state.engine.runnable
       ? `<div class="notice warn">Finish engine setup in Settings before starting your first scan.</div>`
       : '') +
     activeScan() +
@@ -264,8 +301,18 @@ function scanCenter() {
 }
 
 function scheduleCard(s) {
-  const saved = state.settings.schedules.find(x => x.id === s.id);
+  const runtime = state.schedule.runtime[s.id] || {};
+  const retry = runtime.pending;
   const option = (value, text, selected) => `<option value="${value}" ${selected ? 'selected' : ''}>${text}</option>`;
+  const outcome = {
+    completed: 'Completed',
+    partial: 'Completed with warnings',
+    error: 'Failed',
+    'failed-to-start': 'Could not start',
+    cancelled: 'Cancelled by you',
+    interrupted: 'Interrupted',
+    covered: 'Covered by the full scan'
+  }[runtime.lastOutcome];
   return `
     <section class="card panel">
       <div class="row spread">
@@ -291,7 +338,22 @@ function scheduleCard(s) {
           <input id="time-${s.id}" type="time" value="${s.time}" data-schedule="${s.id}" data-field="time">
         </div>
       </div>
-      <p>Next saved run: ${s.enabled ? date(saved.next) : 'Paused'} · Uses this device’s local timezone</p>
+      ${
+        retry
+          ? `<div class="notice ${retry.attempts ? 'warn' : ''}">${
+              retry.attempts
+                ? `The run due ${date(retry.occurrence)} has not completed (${retry.attempts} failed attempt${retry.attempts === 1 ? '' : 's'}${retry.lastError ? ': ' + esc(retry.lastError) : ''}). Next attempt ${date(retry.retryAfter)}.`
+                : `The run due ${date(retry.occurrence)} is waiting to start${retry.retryAfter ? ' at ' + date(retry.retryAfter) : ''}.`
+            }</div>`
+          : ''
+      }
+      ${facts([
+        ['Next scheduled run', s.enabled && runtime.next ? date(runtime.next) : 'Paused'],
+        ['Last attempt', date(runtime.lastAttempt)],
+        ['Last result', outcome ? `${outcome} · ${date(runtime.lastOutcomeAt)}` : 'Not yet'],
+        ['Last success', date(runtime.lastSuccess)]
+      ])}
+      <p>Uses this device’s local timezone. Saved changes re-plan the schedule from now.</p>
     </section>`;
 }
 
@@ -302,13 +364,40 @@ function schedules() {
       'Set it once. Let Sentinel keep the rhythm.',
       btn('Save changes', 'save', '', 'primary')
     ) +
-    `<div class="notice">Schedules run while Sentinel is open or in the system tray. Missed scans run after the app resumes. Enable launch at sign-in in Settings to keep your routine running.</div>` +
+    `<div class="notice">Schedules run while Sentinel is open or in the system tray. A run missed while the computer was off runs once when Sentinel is next running. Failed runs retry automatically, starting after 15 minutes and backing off to every 6 hours. When both are due, the full scan runs first and also covers the quick scan.</div>` +
     `<div class="stack">${draft.schedules.map(scheduleCard).join('')}</div>`
   );
 }
 
+function reviewQueue() {
+  const open = unresolved();
+  if (!open.length) return '';
+  return `
+    <section class="card panel">
+      <div class="panel-top"><h2>Needs review</h2>${pill(open.length + ' unresolved', 'red')}</div>
+      <p>Detections stay here until you act on them, even after older scan reports are removed.</p>
+      ${open
+        .map(
+          d => `
+            <div class="review-item">
+              <div>
+                <strong>${esc(d.signature)}</strong>
+                <div class="path">${esc(d.path)}</div>
+                <p>First seen ${date(d.firstSeen)}${d.sightings > 1 ? ` · seen in ${d.sightings} scans, most recently ${date(d.lastSeen)}` : ''}${d.status === 'missing' ? ' · <b>the file is no longer at this location</b>' : ''}</p>
+              </div>
+              ${
+                d.status === 'missing'
+                  ? btn('Mark resolved', 'resolve-detection', d.id, 'small')
+                  : btn('Quarantine file', 'quarantine', d.id, 'small danger', !!state.active)
+              }
+            </div>`
+        )
+        .join('')}
+    </section>`;
+}
+
 function historyItem(h) {
-  const tone = ['error', 'partial'].includes(h.status)
+  const tone = ['error', 'partial', 'interrupted'].includes(h.status)
     ? 'amber'
     : h.threats.length
       ? 'red'
@@ -316,27 +405,31 @@ function historyItem(h) {
         ? 'neutral'
         : '';
   const threats = h.threats
-    .map(
-      t => `
+    .map(t => {
+      const status = detectionById(t.detectionId)?.status || 'unknown';
+      return `
         <div class="threat">
           <strong>${esc(t.signature)}</strong>
           <div class="path">${esc(t.path)}</div>
-          ${t.status === 'detected' ? btn('Quarantine file', 'quarantine', t.id, 'small danger') : pill(t.status)}
-        </div>`
-    )
+          ${pill(status === 'detected' ? 'Needs review' : status)}
+        </div>`;
+    })
     .join('');
+  const warnings = h.warningCount ?? h.warnings.length;
   return `
     <details class="history-item">
       <summary>
         <div>
           <strong>${labels[h.kind]} ${h.scheduled ? '· scheduled' : ''}</strong>
-          <small>${date(h.finished)} · ${h.files.toLocaleString()} files · ${h.threats.length} detections</small>
+          <small>${date(h.finished)} · ${h.files.toLocaleString()} files · ${h.threats.length} detections${warnings ? ` · ${warnings} warnings` : ''}</small>
         </div>
         ${pill(h.status, tone)}
       </summary>
       <div class="history-detail">
         <p class="path">${h.targets.map(esc).join(' · ')}</p>
-        ${h.warnings.length ? `<div class="notice warn">${h.warnings.map(esc).join('<br>')}</div>` : ''}
+        ${h.engineVersion ? `<p>${esc(h.engineVersion)} · definitions version ${esc(h.databaseVersion ?? 'unknown')}</p>` : ''}
+        ${h.warnings.length ? `<div class="notice warn">${h.warnings.map(esc).join('<br>')}${warnings > h.warnings.length ? `<br>…and ${warnings - h.warnings.length} more in the scan log.` : ''}</div>` : ''}
+        ${h.logTruncated ? '<p>The scan log reached its size limit and was truncated.</p>' : ''}
         ${threats}
         <div class="row">${btn('Export report', 'export', h.id, 'small', false, 'download')}</div>
       </div>
@@ -352,58 +445,105 @@ function activity() {
       'Activity & reports',
       'The details behind every scan, in one place.',
       btn('Open scan logs', 'logs', '', '', false, 'folder')
-    ) + `<section class="card panel">${body}</section>`
+    ) +
+    `<div class="stack">${reviewQueue()}<section class="card panel"><div class="panel-top"><h2>Scan reports</h2><span class="muted">The latest 200 reports are kept</span></div>${body}</section></div>`
   );
+}
+
+function quarantineItem(q) {
+  const tone = { quarantined: 'neutral', 'recovery-needed': 'amber', failed: 'red' }[q.status] || 'neutral';
+  const label =
+    {
+      'recovery-needed': 'Needs review',
+      reviewed: 'Reviewed',
+      prepared: 'In progress',
+      copying: 'In progress',
+      restoring: 'Restoring'
+    }[q.status] || q.status;
+  const actions = [];
+  if (q.status === 'quarantined') actions.push(btn('Restore file', 'restore', q.id, 'small'));
+  if (q.status === 'recovery-needed') {
+    if (q.options.includes('finish')) actions.push(btn('Finish quarantine', 'quarantine-finish', q.id, 'small danger'));
+    if (q.options.includes('undo')) actions.push(btn('Undo quarantine', 'quarantine-undo', q.id, 'small'));
+    if (q.options.includes('dismiss')) actions.push(btn('Mark reviewed', 'quarantine-dismiss', q.id, 'small'));
+  }
+  return `
+    <div class="history-item">
+      <div class="row spread"><h3>${esc(q.signature)}</h3>${pill(label, tone)}</div>
+      <p class="path">${esc(q.original)}</p>
+      <p>${date(q.created)}${q.size != null ? ` · ${q.size.toLocaleString()} bytes` : ''}${q.sha256 ? ` · SHA-256 ${esc(q.sha256.slice(0, 16))}…` : ''}</p>
+      ${q.issue ? `<div class="notice warn">${esc(q.issue)}</div>` : ''}
+      ${q.error ? `<p>${esc(q.error)}</p>` : ''}
+      ${q.status === 'restored' && q.restoreTarget && q.restoreTarget !== q.original ? `<p>Restored to <span class="path">${esc(q.restoreTarget)}</span></p>` : ''}
+      ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
+    </div>`;
 }
 
 function quarantine() {
   const body = state.quarantine.length
-    ? state.quarantine
-        .map(
-          q => `
-            <div class="history-item">
-              <div class="row spread"><h3>${esc(q.signature)}</h3>${pill(q.status, q.status === 'error' ? 'red' : 'neutral')}</div>
-              <p class="path">${esc(q.original)}</p>
-              <p>${date(q.date)}</p>
-              ${q.error ? `<p>${esc(q.error)}</p>` : ''}
-              ${q.status === 'quarantined' ? btn('Restore file', 'restore', q.id, 'small') : ''}
-            </div>`
-        )
-        .join('')
+    ? state.quarantine.map(quarantineItem).join('')
     : `<div class="wide-empty">${icon('box')}<h2>Nothing in quarantine.</h2><p>When a scan detects a threat, review it in Activity and choose whether to quarantine the file.</p></div>`;
   return (
     heading('Quarantine', 'Keep detected files out of their original location.') +
-    `<div class="notice">Quarantine moves a file into Sentinel’s local storage with a non-executable extension. Files are never automatically deleted. Restore only files you trust.</div>` +
+    `<div class="notice">Quarantine moves a file into Sentinel’s local storage with a non-executable extension after checking it is the same file that was detected. Files are never automatically deleted, and an interrupted operation keeps every copy until you decide. Restore only files you trust; restoring never replaces an existing file.</div>` +
     `<section class="card panel">${body}</section>`
   );
 }
 
 function engineSection() {
-  const { engine, installing, updating } = state;
+  const { engine, installing, updating, database: db, updates } = state;
   const steps = `
     <div class="setup-steps">
       <div class="step"><div class="step-number">1</div><h3>Install the engine</h3><p>Private, per-user installation. No administrator access required.</p></div>
       <div class="step"><div class="step-number">2</div><h3>Get fresh definitions</h3><p>Download ClamAV’s official malware signature database.</p></div>
       <div class="step"><div class="step-number">3</div><h3>Make it a routine</h3><p>Daily quick scans and weekly full scans are ready to go.</p></div>
     </div>`;
-  const primary = !engine.available
-    ? btn(
-        installing ? 'Installing ClamAV…' : 'Install ClamAV & set up',
-        'install',
-        '',
-        'primary',
-        !!installing,
-        'download'
-      )
+  const ready = engine.runnable && db.present;
+  const primary = !engine.runnable
+    ? installing
+      ? btn('Cancel setup', 'cancel-install', '', 'danger', false)
+      : btn('Install ClamAV & set up', 'install', '', 'primary', busyEngine(), 'download')
     : btn(updating ? 'Updating definitions…' : 'Update definitions', 'update', '', 'primary', busyEngine(), 'refresh');
+  const staleOptions = [1, 2, 3, 5, 7, 14]
+    .map(
+      n => `<option value="${n}" ${draft.staleAfterDays === n ? 'selected' : ''}>${n} day${n === 1 ? '' : 's'}</option>`
+    )
+    .join('');
   return `
     <section class="card panel">
       <div class="panel-top">
-        <div><div class="eyebrow">ENGINE & DEFINITIONS</div><h2>${engine.ready ? 'Your ClamAV engine is ready' : 'Welcome. Let’s get you set up.'}</h2></div>
-        ${pill(engine.ready ? 'Ready' : 'Setup required', engine.ready ? '' : 'amber')}
+        <div><div class="eyebrow">ENGINE & DEFINITIONS</div><h2>${ready ? 'Your ClamAV engine is ready' : 'Welcome. Let’s get you set up.'}</h2></div>
+        ${pill(ready ? 'Ready' : 'Setup required', ready ? '' : 'amber')}
       </div>
       <p>Install the official ClamAV engine and its signature database with one click. Sentinel downloads the Windows engine from Cisco Talos and verifies its SHA-256 checksum.</p>
-      ${engine.ready ? `<p class="path">${esc(engine.version)}<br>${esc(engine.dir)}</p>` : steps}
+      ${
+        engine.installed
+          ? `<p class="path">${esc(engine.version || engine.error)}<br>${esc(engine.dir)}</p>` +
+            facts([
+              ['Definitions version', db.version ?? 'Unknown'],
+              ['Definitions built', db.buildTime ? date(db.buildTime) : 'Unknown'],
+              [
+                'Signature check',
+                db.verified === true
+                  ? 'Verified by sigtool'
+                  : db.verified === false
+                    ? 'Failed: ' + esc(db.failures.join(', '))
+                    : 'Not yet verified'
+              ],
+              ['Last update check', date(updates.lastCheck)],
+              ['Last successful update', date(updates.lastSuccess)],
+              [
+                'Next automatic attempt',
+                updates.nextAttempt
+                  ? date(updates.nextAttempt)
+                  : state.settings.autoUpdate
+                    ? 'Within the hour'
+                    : 'Automatic updates off'
+              ]
+            ])
+          : steps
+      }
+      ${updates.failure ? `<div class="notice warn">${esc(updates.failure.message)} (${updates.failures} failed attempt${updates.failures === 1 ? '' : 's'} in a row)</div>` : ''}
       <div class="row">
         ${primary}
         ${btn('Use existing installation', 'engine', '', '', busyEngine())}
@@ -412,11 +552,24 @@ function engineSection() {
       ${installing || state.installOutput ? `<pre class="log" data-live="installOutput">${esc(live.installOutput())}</pre>` : ''}
       ${state.updateOutput ? `<pre class="log" data-live="updateOutput">${esc(live.updateOutput())}</pre>` : ''}
       <div class="setting-row">
-        <div><h3>Keep definitions up to date</h3><p>Check hourly while Sentinel runs. Failed updates retry with increasing delays, up to every six hours.</p></div>
+        <div><h3>Keep definitions up to date</h3><p>Check hourly while Sentinel runs. Failed updates retry with increasing delays, up to every six hours, and the delay is kept across restarts.</p></div>
         <input class="toggle" type="checkbox" aria-label="Automatic signature updates" data-setting="autoUpdate" ${draft.autoUpdate ? 'checked' : ''}>
       </div>
-      <p>Last successful update: ${date(state.lastUpdate)}</p>
+      <div class="setting-row">
+        <div><h3>Treat definitions as outdated after</h3><p>Based on when ClamAV built the definitions, not when Sentinel last checked for updates.</p></div>
+        <select aria-label="Definitions outdated after" data-setting="staleAfterDays">${staleOptions}</select>
+      </div>
     </section>`;
+}
+
+function storageNotice() {
+  if (!state.storageIssues.length) return '';
+  return `
+    <div class="notice warn">
+      <strong>Some saved data needed recovery.</strong>
+      ${state.storageIssues.map(i => `<p>${esc(i.file)}: ${esc(i.message)}${i.preservedAs ? ` The original was kept as <span class="path">${esc(i.preservedAs)}</span>.` : ''}</p>`).join('')}
+      <div class="row">${btn('Open data folder', 'data-folder', '', 'small', false, 'folder')}${btn('Dismiss', 'dismiss-storage-issues', '', 'small')}</div>
+    </div>`;
 }
 
 function settings() {
@@ -432,12 +585,13 @@ function settings() {
   return (
     heading('Settings', 'Protection that fits the way you work.', btn('Save preferences', 'save', '', 'primary')) +
     `<div class="stack">
+      ${storageNotice()}
       ${engineSection()}
       <section class="card panel">
         <h2>Desktop experience</h2>
         ${toggle('launchAtLogin', 'Launch at Windows sign-in', state.packaged ? 'Start quietly in the system tray so schedules can run.' : 'Available after installing the packaged Windows app.')}
         ${toggle('closeToTray', 'Keep running when the window closes', 'Continue scheduled scans and updates from the system tray.')}
-        ${toggle('notifications', 'Desktop notifications', 'Get notified when scans finish or something needs attention.')}
+        ${toggle('notifications', 'Desktop notifications', 'Get notified when scans finish or something needs attention. Repeated failures notify once.')}
       </section>
       <section class="card panel">
         <h2>Scan preferences</h2>
@@ -457,28 +611,48 @@ const pages = { overview, scans: scanCenter, schedules, quarantine, activity, se
 
 function render() {
   if (!state) return;
+  stale = false;
   document.querySelector('#crumb').textContent = views.find(v => v[0] === current)[2];
   document.querySelector('#app-version').textContent = 'v' + state.version;
+  const badge = unresolved().length;
   document.querySelector('#nav').innerHTML = views
     .map(
       ([key, image, label]) =>
-        `<button data-action="navigate" data-value="${key}" class="${current === key ? 'active' : ''}" ${current === key ? 'aria-current="page"' : ''}>${icon(image)}${label}</button>`
+        `<button data-action="navigate" data-value="${key}" class="${current === key ? 'active' : ''}" ${current === key ? 'aria-current="page"' : ''}>${icon(image)}${label}${key === 'activity' && badge ? ` <span class="pill red" aria-label="${badge} unresolved">${badge}</span>` : ''}</button>`
     )
     .join('');
   document.querySelector('#main').innerHTML = pages[current]();
 }
 
+// A state update is deferred while the user edits a field or reads an expanded report; it is applied as
+// soon as that interaction ends so the page never stays out of date.
+const interacting = () => document.activeElement?.matches('input,select') || !!document.querySelector('details[open]');
+function renderWhenIdle() {
+  if (interacting()) stale = true;
+  else render();
+}
+document.addEventListener('focusout', () => setTimeout(() => stale && renderWhenIdle()));
+document.addEventListener('toggle', () => stale && renderWhenIdle(), true);
+
 // ---- Events ----
 
 document.addEventListener('change', event => {
   const el = event.target;
-  if (el.dataset.setting) draft[el.dataset.setting] = el.checked;
+  if (el.dataset.setting) draft[el.dataset.setting] = el.type === 'checkbox' ? el.checked : Number(el.value);
   if (el.dataset.schedule) {
     const s = draft.schedules.find(s => s.id === el.dataset.schedule);
     s[el.dataset.field] =
       el.type === 'checkbox' ? el.checked : el.dataset.field === 'day' ? Number(el.value) : el.value;
   }
 });
+
+// Buttons whose action maps to a different request.
+const requests = {
+  save: () => ['settings', draft],
+  'quarantine-finish': id => ['quarantine-resolve', { id, action: 'finish' }],
+  'quarantine-undo': id => ['quarantine-resolve', { id, action: 'undo' }],
+  'quarantine-dismiss': id => ['quarantine-resolve', { id, action: 'dismiss' }]
+};
 
 document.addEventListener('click', async event => {
   const button = event.target.closest('[data-action]');
@@ -496,14 +670,15 @@ document.addEventListener('click', async event => {
   pending.add(key);
   button.disabled = true;
   try {
-    await call(action === 'save' ? 'settings' : action, action === 'save' ? draft : value);
+    const [name, payload] = requests[action] ? requests[action](value) : [action, value];
+    await call(name, payload);
     state = await call('state');
     if (action === 'save') {
       draft = structuredClone(state.settings);
       toast('Your preferences are saved.');
     }
     if (['scan', 'custom'].includes(action)) current = 'scans';
-    if (action === 'install') toast('ClamAV setup completed. You’re ready to scan.');
+    if (action === 'install' && state.engine.runnable) toast('ClamAV setup completed. You’re ready to scan.');
     if (action === 'update') toast('Signature database updated.');
     render();
   } catch (err) {
@@ -523,8 +698,7 @@ window.sentinel.subscribe((kind, data) => {
   }
   state = data;
   if (!draft) draft = structuredClone(state.settings);
-  // Avoid rebuilding the page while the user is editing a field or reading an expanded report.
-  if (!document.activeElement?.matches('input,select') && !document.querySelector('details[open]')) render();
+  renderWhenIdle();
 });
 
 call('state')

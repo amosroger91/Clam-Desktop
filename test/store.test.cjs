@@ -79,6 +79,7 @@ test('migrates version 1.0 settings and keeps legacy schedule runs available', (
   assert.equal(migrated, true);
   assert.equal(value.engineDir, 'C:\\engine');
   assert.equal(value.notifications, false);
+  assert.equal(value.staleAfterDays, 3);
   assert.deepEqual(value.schedules[0], { id: 'quick', enabled: true, frequency: 'daily', time: '09:30', day: 0 });
   assert.equal(value.schedules[1].enabled, false);
   assert.equal(legacy.schedules[0].next, '2026-09-27T13:30:00.000Z');

@@ -778,6 +778,116 @@ select {
 #toast.visible {
   display: block;
 }
+/* Health status: the hero and check list reflect verified state, not decoration. */
+.hero.attention {
+  border-color: #efdcb8;
+  background: radial-gradient(ellipse at 90% 40%, #fbecd0 0, transparent 54%), #fff9ef;
+}
+.hero.problem,
+.hero.setup {
+  border-color: #f0d3d6;
+  background: radial-gradient(ellipse at 90% 40%, #f9e0e2 0, transparent 54%), #fff6f6;
+}
+.hero.attention .hero-mark,
+.hero.problem .hero-mark,
+.hero.setup .hero-mark {
+  background: #fff;
+  border-color: #eadbd0;
+}
+.hero.attention .hero-mark svg {
+  color: #a56f23;
+}
+.hero.problem .hero-mark svg,
+.hero.setup .hero-mark svg {
+  color: #b74b56;
+}
+.hero.attention h2,
+.hero.problem h2,
+.hero.setup h2 {
+  color: #3a2a1c;
+}
+.hero.attention p,
+.hero.problem p,
+.hero.setup p {
+  color: #7a6a5c;
+}
+.checks {
+  display: grid;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 0;
+  border-bottom: 1px solid #e9edf3;
+}
+.check:last-child {
+  border-bottom: 0;
+}
+.check > div {
+  flex: 1;
+  min-width: 0;
+}
+.check strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+.check p {
+  font-size: 11px;
+}
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #37b893;
+}
+.dot.warn,
+.dot.off {
+  background: #e0a64a;
+}
+.dot.error {
+  background: #d05b66;
+}
+.review-item {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 0;
+  border-bottom: 1px solid #e9edf3;
+}
+.review-item:last-child {
+  border-bottom: 0;
+}
+.review-item > div {
+  min-width: 0;
+}
+.review-item strong {
+  font-size: 12px;
+  color: #ad4c4c;
+}
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px 20px;
+  margin: 14px 0;
+}
+.facts div {
+  font-size: 11px;
+  color: #7a8799;
+}
+.facts strong {
+  display: block;
+  color: #1d293d;
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 2px;
+}
+.field select,
+.setting-row select {
+  min-width: 120px;
+}
 @media (max-width: 1140px) {
   .sidebar {
     width: 205px;
@@ -813,4 +923,12 @@ select {
   .scan-card {
     padding: 18px;
   }
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }

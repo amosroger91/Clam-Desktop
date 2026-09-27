@@ -31,26 +31,55 @@ async function checkRenderer(win) {
   console.log('Electron smoke test passed: dashboard, five screens, preferences, and invalid IPC input.');
 }
 
-// Runs a real scan when a previously downloaded engine and database are available.
+async function capture(win, page, name) {
+  await win.webContents.executeJavaScript(`document.querySelector('nav [data-value="${page}"]').click()`);
+  await new Promise(resolve => setTimeout(resolve, 300));
+  write(name, (await win.webContents.capturePage()).toPNG());
+}
+
+// Runs real scans when a previously downloaded engine and database are available: a full scan lifecycle
+// with a harmless synthetic detection, then a shutdown during a scan, which must be saved as interrupted.
 async function checkEngine(app) {
-  if (
-    !fs.existsSync(path.join(testRoot, 'engine-path.txt')) ||
-    !fs.existsSync(path.join(testRoot, 'database/daily.cvd'))
-  )
+  const source = path.join(testRoot, 'database');
+  if (!fs.existsSync(path.join(testRoot, 'engine-path.txt')) || !fs.existsSync(path.join(source, 'main.cvd'))) {
+    console.log('Skipped real-engine checks: test-output/engine-path.txt and database/main.cvd are not present.');
     return;
+  }
   app.setEngineDir(fs.readFileSync(path.join(testRoot, 'engine-path.txt'), 'utf8').trim());
-  fs.copyFileSync(path.join(testRoot, 'database/daily.cvd'), path.join(app.db, 'daily.cvd'));
+  for (const name of ['main.cvd', 'daily.cvd', 'bytecode.cvd'])
+    fs.copyFileSync(path.join(source, name), path.join(app.db, name));
   fs.copyFileSync(path.join(testRoot, 'fixture-db/test.hdb'), path.join(app.db, 'test.hdb'));
   await app.detectEngine();
   await app.scan('custom', [path.join(testRoot, 'fixtures')]);
-  const deadline = Date.now() + 60000;
+  const deadline = Date.now() + 180000;
   while (app.isScanning() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
   const report = app.latestReport();
-  if (app.isScanning() || report?.status !== 'completed' || report?.threats.length !== 1) {
-    throw Error('Actual engine lifecycle check failed.');
-  }
-  console.log('Real ClamAV lifecycle passed: spawn, progress, detection, exit status, and persisted report.');
+  const state = app.state();
+  const open = state.detections.filter(d => d.status === 'detected');
+  if (app.isScanning() || report?.status !== 'completed' || report?.threats.length !== 1 || open.length !== 1)
+    throw Error(
+      'Actual engine lifecycle check failed: ' + JSON.stringify({ status: report?.status, open: open.length })
+    );
+  if (state.health.state !== 'problem' || !/detection needs review/.test(state.health.headline))
+    throw Error('Health did not report the unresolved detection: ' + state.health.headline);
+  console.log(
+    'Real ClamAV lifecycle passed: spawn, progress, detection store, health, exit status, and persisted report.'
+  );
   write('lifecycle.json', JSON.stringify(report, null, 2));
+  await capture(app.win, 'overview', 'dashboard-detection.png');
+  await capture(app.win, 'activity', 'activity.png');
+
+  // Quit while a scan is running: the report must be finished as interrupted and written to disk.
+  await app.scan('custom', [path.join(testRoot, 'fixtures')]);
+  await app.shutdown();
+  const interrupted = app.latestReport();
+  const saved = JSON.parse(fs.readFileSync(path.join(path.dirname(app.db), 'history.json'), 'utf8')).data[0];
+  const jobs = JSON.parse(fs.readFileSync(path.join(path.dirname(app.db), 'jobs.json'), 'utf8')).data;
+  if (interrupted.status !== 'interrupted' || saved.id !== interrupted.id || jobs.current !== null)
+    throw Error(
+      'Shutdown during a scan was not recorded: ' + JSON.stringify({ status: interrupted.status, job: jobs.current })
+    );
+  console.log('Shutdown during a scan passed: the scan was stopped and saved as interrupted.');
 }
 
 module.exports = function runSmokeTest(win, app) {
