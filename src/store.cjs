@@ -55,9 +55,15 @@ function unwrap(parsed) {
   return { version: 0, data: parsed };
 }
 
+// Generations: `name.json` (primary), `name.json.tmp` (a new generation being committed), and
+// `name.json.bak` (the previous valid primary). A save writes and fsyncs the new generation before
+// touching anything else, rotates the primary into the backup only if the primary is itself valid, and
+// keeps a complete new generation when its promotion fails. Loading picks the newest valid candidate.
 function createStore(root, { fs = nodeFs, now = () => new Date() } = {}) {
   const file = name => path.join(root, name + '.json');
   const stamp = () => now().toISOString().replace(/[:.]/g, '-');
+  // Files written by a newer Sentinel: kept untouched until an update can read them.
+  const readOnly = new Set();
 
   function preserve(target, reason) {
     const copy = `${target}.${reason}-${stamp()}`;
@@ -69,42 +75,62 @@ function createStore(root, { fs = nodeFs, now = () => new Date() } = {}) {
     }
   }
 
-  function parse(target) {
-    return unwrap(JSON.parse(fs.readFileSync(target, 'utf8')));
+  function read(target) {
+    const raw = JSON.parse(fs.readFileSync(target, 'utf8'));
+    return { ...unwrap(raw), savedAt: typeof raw?.savedAt === 'string' ? raw.savedAt : '' };
+  }
+  function tryRead(target) {
+    try {
+      return { ok: true, ...read(target) };
+    } catch (err) {
+      return { ok: false, missing: err.code === 'ENOENT' };
+    }
   }
 
   /**
    * spec: { version, fallback(), migrations: { [from]: data => data }, validate(data) => { value, problems } }
-   * Returns { value, issue, legacy } where legacy is the pre-migration schema-0 data, if any.
+   * Returns { value, issue, legacy, migrated, readOnly } where legacy is the pre-migration schema-0 data.
    */
   function load(name, spec) {
     const target = file(name);
-    // A leftover temporary file is an abandoned write; the committed file (or its backup) is authoritative.
-    try {
-      fs.rmSync(target + '.tmp', { force: true });
-    } catch {}
+    const primary = tryRead(target);
+    const pending = tryRead(target + '.tmp');
     let loaded,
-      issue = null;
-    try {
-      loaded = parse(target);
-    } catch (err) {
-      if (err.code === 'ENOENT' && !fs.existsSync(target + '.bak')) return { value: spec.fallback(), issue: null };
-      const preservedAs = err.code === 'ENOENT' ? null : preserve(target, 'corrupt');
+      issue = null,
+      preservedAs = null;
+    if (!pending.ok && !pending.missing) {
+      // A partially written generation was abandoned mid-write; the committed files are authoritative.
       try {
-        loaded = parse(target + '.bak');
-        issue = { file: name, message: 'Could not be read, so the previous saved copy was restored.', preservedAs };
-      } catch {
+        fs.rmSync(target + '.tmp', { force: true });
+      } catch {}
+    }
+    if (!primary.ok && !primary.missing) preservedAs = preserve(target, 'corrupt');
+    if (pending.ok && (!primary.ok || pending.savedAt > primary.savedAt)) {
+      loaded = pending;
+      issue = { file: name, message: 'The latest save had not finished, so it was completed on startup.', preservedAs };
+    } else if (primary.ok) loaded = primary;
+    else {
+      const backup = tryRead(target + '.bak');
+      if (!backup.ok) {
+        if (primary.missing && backup.missing) return { value: spec.fallback(), issue: null };
         return {
           value: spec.fallback(),
           issue: { file: name, message: 'Could not be read and was reset to defaults.', preservedAs }
         };
       }
+      loaded = backup;
+      issue = { file: name, message: 'Could not be read, so the previous saved copy was restored.', preservedAs };
     }
     if (loaded.version > spec.version) {
-      const preservedAs = preserve(target, 'newer');
+      readOnly.add(name);
       return {
         value: spec.fallback(),
-        issue: { file: name, message: 'Was created by a newer version of Sentinel and could not be used.', preservedAs }
+        readOnly: true,
+        issue: {
+          file: name,
+          message:
+            'Was created by a newer version of Sentinel. It is kept unchanged, and changes to it cannot be saved until Sentinel is updated.'
+        }
       };
     }
     const legacy = loaded.version === 0 ? loaded.data : undefined;
@@ -112,18 +138,24 @@ function createStore(root, { fs = nodeFs, now = () => new Date() } = {}) {
     try {
       for (let v = loaded.version; v < spec.version; v++) data = spec.migrations[v](data);
     } catch (err) {
-      const preservedAs = preserve(target, 'unmigrated');
       return {
         value: spec.fallback(),
-        issue: { file: name, message: 'Could not be upgraded (' + err.message + ') and was reset.', preservedAs },
+        issue: {
+          file: name,
+          message: 'Could not be upgraded (' + err.message + ') and was reset.',
+          preservedAs: preserve(target, 'unmigrated')
+        },
         legacy
       };
     }
     const { value, problems } = spec.validate(data);
     if (problems.length) {
-      const preservedAs = issue?.preservedAs ?? preserve(target, 'invalid');
       const detail = problems.slice(0, 3).join('; ') + (problems.length > 3 ? `; and ${problems.length - 3} more` : '');
-      issue = { file: name, message: 'Contained invalid entries that were set aside: ' + detail + '.', preservedAs };
+      issue = {
+        file: name,
+        message: 'Contained invalid entries that were set aside: ' + detail + '.',
+        preservedAs: issue?.preservedAs ?? preserve(target, 'invalid')
+      };
     }
     return { value, issue, legacy, migrated: loaded.version !== spec.version };
   }
@@ -131,7 +163,13 @@ function createStore(root, { fs = nodeFs, now = () => new Date() } = {}) {
   function save(name, value, version) {
     const target = file(name);
     const tmp = target + '.tmp';
+    if (readOnly.has(name))
+      throw new StorageError(
+        `${path.basename(target)} was created by a newer version of Sentinel and is kept unchanged. Update Sentinel to save changes.`,
+        { code: 'EREADONLY', file: target }
+      );
     const text = JSON.stringify({ schema: version, savedAt: now().toISOString(), data: value }, null, 2);
+    // 1. Write and fsync the new generation. A failure here leaves the committed files untouched.
     try {
       fs.mkdirSync(root, { recursive: true });
       const fd = fs.openSync(tmp, 'w');
@@ -141,12 +179,19 @@ function createStore(root, { fs = nodeFs, now = () => new Date() } = {}) {
       } finally {
         fs.closeSync(fd);
       }
-      if (fs.existsSync(target)) retrying(() => fs.copyFileSync(target, target + '.bak'));
-      retrying(() => fs.renameSync(tmp, target));
     } catch (err) {
       try {
         fs.rmSync(tmp, { force: true });
       } catch {}
+      throw new StorageError(describeFailure(err, target), { code: err.code, file: target, cause: err });
+    }
+    // 2. Rotate the primary into the backup only when it is valid, so a corrupt primary can never
+    //    replace a known-good backup. 3. Promote the new generation. If either fails, the complete
+    //    new generation stays on disk and is preferred on the next load.
+    try {
+      if (tryRead(target).ok) retrying(() => fs.copyFileSync(target, target + '.bak'));
+      retrying(() => fs.renameSync(tmp, target));
+    } catch (err) {
       throw new StorageError(describeFailure(err, target), { code: err.code, file: target, cause: err });
     }
   }

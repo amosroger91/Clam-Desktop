@@ -113,11 +113,11 @@ test('an unreadable file without a backup resets with a visible issue', () => {
   assert.ok(files().some(f => f.startsWith('settings.json.corrupt-')));
 });
 
-test('a file from a newer version is preserved, not overwritten blindly', () => {
+test('a file from a newer version is left in place, not overwritten blindly', () => {
   write('settings', JSON.stringify({ schema: 99, data: {} }));
-  const { issue } = store.load('settings', schemas.settings);
+  const { issue, readOnly } = store.load('settings', schemas.settings);
   assert.match(issue.message, /newer version/);
-  assert.ok(fs.existsSync(issue.preservedAs));
+  assert.equal(readOnly, true);
 });
 
 test('an abandoned temporary write is discarded in favour of the committed file', () => {
@@ -261,4 +261,88 @@ test('a resolved detection is not reused for a new sighting', () => {
   });
   assert.notEqual(again, d);
   assert.equal(list.length, 2);
+});
+
+// ---- R07: saving recovered state must never destroy the only valid generation ----
+
+const plainSpec = { version: 1, fallback: () => null, migrations: {}, validate: v => ({ value: v, problems: [] }) };
+// Persistently fails the given operation on the given file, like a disk or lock failure at that step.
+function failingFs(op, match) {
+  const wrap =
+    name =>
+    (...args) => {
+      if (op === name && String(args[op === 'renameSync' ? 1 : 0]).endsWith(match))
+        throw Object.assign(Error(name + ' failed'), { code: 'EPERM' });
+      return fs[name](...args);
+    };
+  return { ...fs, openSync: wrap('openSync'), copyFileSync: wrap('copyFileSync'), renameSync: wrap('renameSync') };
+}
+function corruptPrimaryWithGoodBackup() {
+  store.save('history', ['good'], 1);
+  store.save('history', ['good'], 1); // backup now holds ['good'] too
+  fs.writeFileSync(path.join(dir, 'history.json'), 'broken');
+}
+
+test('R07: recover from backup, then a failed save at any step leaves a valid generation', () => {
+  for (const [op, match] of [
+    ['openSync', 'history.json.tmp'],
+    ['copyFileSync', 'history.json'],
+    ['renameSync', 'history.json']
+  ]) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.mkdirSync(dir);
+    store = createStore(dir);
+    corruptPrimaryWithGoodBackup();
+    const recovered = store.load('history', plainSpec);
+    assert.deepEqual(recovered.value, ['good']);
+    const flaky = createStore(dir, { fs: failingFs(op, match) });
+    try {
+      flaky.save('history', ['good', 'new'], 1);
+    } catch (err) {
+      assert.ok(err instanceof StorageError);
+    }
+    // The known-good backup is never replaced by the corrupt primary.
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'history.json.bak'), 'utf8')).data, ['good']);
+    // Restarting (twice) always finds a validated generation: the new save if it completed, else the old one.
+    for (let i = 0; i < 2; i++) {
+      const { value } = createStore(dir).load('history', plainSpec);
+      assert.ok(
+        JSON.stringify(value) === '["good","new"]' || JSON.stringify(value) === '["good"]',
+        `${op}: ${JSON.stringify(value)}`
+      );
+    }
+  }
+});
+
+test('R07: a complete new generation whose promotion failed is kept and preferred on restart', () => {
+  store.save('history', ['old'], 1);
+  const flaky = createStore(dir, { fs: failingFs('renameSync', 'history.json') });
+  assert.throws(() => flaky.save('history', ['new'], 1), StorageError);
+  assert.ok(fs.existsSync(path.join(dir, 'history.json.tmp')));
+  const { value, issue } = createStore(dir).load('history', plainSpec);
+  assert.deepEqual(value, ['new']);
+  assert.match(issue.message, /latest save/);
+});
+
+test('R07: a partially written temporary file is discarded', () => {
+  store.save('history', ['old'], 1);
+  fs.writeFileSync(path.join(dir, 'history.json.tmp'), '{"schema":1,"savedAt":"2099');
+  const { value, issue } = createStore(dir).load('history', plainSpec);
+  assert.deepEqual(value, ['old']);
+  assert.equal(issue, null);
+  assert.ok(!fs.existsSync(path.join(dir, 'history.json.tmp')));
+});
+
+test('R07: a file from a newer version is read-only and never overwritten', () => {
+  const newer = JSON.stringify({ schema: 99, savedAt: '2027-01-01T00:00:00.000Z', data: { future: true } });
+  fs.writeFileSync(path.join(dir, 'settings.json'), newer);
+  const s = createStore(dir);
+  const { issue, readOnly } = s.load('settings', schemas.settings);
+  assert.equal(readOnly, true);
+  assert.match(issue.message, /newer version/);
+  assert.throws(
+    () => s.save('settings', {}, 1),
+    err => err instanceof StorageError && err.code === 'EREADONLY'
+  );
+  assert.equal(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'), newer);
 });
