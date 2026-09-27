@@ -22,13 +22,29 @@ async function checkRenderer(win) {
     prefs.notifications = false;
     const saved = await window.sentinel.call('settings', prefs);
     const invalid = await window.sentinel.call('scan', 'injected-type');
-    return { results, saved: saved.ok, rejectedInvalidScan: !invalid.ok };
+    // Unsaved edits are not discarded silently: navigating away asks first, and Discard then proceeds.
+    document.querySelector('nav [data-value="settings"]').click();
+    document.querySelector('[data-setting="closeToTray"]').click();
+    document.querySelector('nav [data-value="overview"]').click();
+    const guarded = !!document.querySelector('#unsaved') && document.querySelector('h1').textContent === 'Settings';
+    document.querySelector('[data-action="unsaved-discard"]').click();
+    const discarded = document.querySelector('h1').textContent === 'Security overview';
+    const badge = document.querySelector('#health-badge').textContent;
+    return { results, saved: saved.ok, rejectedInvalidScan: !invalid.ok, unsavedGuard: guarded && discarded, badge };
   })()`);
   write('screens.json', JSON.stringify(screens, null, 2));
-  if (!screens.saved || !screens.rejectedInvalidScan || screens.results.some(s => !s.heading)) {
+  if (
+    !screens.saved ||
+    !screens.rejectedInvalidScan ||
+    !screens.unsavedGuard ||
+    !screens.badge ||
+    screens.results.some(s => !s.heading)
+  ) {
     throw Error('Renderer navigation or IPC check failed.');
   }
-  console.log('Electron smoke test passed: dashboard, five screens, preferences, and invalid IPC input.');
+  console.log(
+    'Electron smoke test passed: dashboard, five screens, preferences, unsaved-changes guard, health badge, and invalid IPC input.'
+  );
 }
 
 async function capture(win, page, name) {

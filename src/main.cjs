@@ -1349,6 +1349,17 @@ if (!app.requestSingleInstanceLock()) {
       .catch(err => storageIssues.push({ file: 'quarantine', message: 'Recovery could not finish: ' + err.message }));
     identifyDetections();
     tickTimer = setInterval(tick, 30000);
+    // Health also changes with time alone, for example when definitions age past the freshness
+    // threshold; republish when the assessment changes even if nothing else happened (R16).
+    let lastHealth = '';
+    setInterval(() => {
+      const h = health();
+      const signature = h.state + '|' + h.headline;
+      if (signature !== lastHealth) {
+        lastHealth = signature;
+        publish(true);
+      }
+    }, 60000).unref();
     powerMonitor.on('resume', tick);
     tick();
     if (smoke)

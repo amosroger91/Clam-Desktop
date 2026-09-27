@@ -62,8 +62,10 @@ async function call(action, payload) {
 
 // ---- Building blocks ----
 
-function btn(text, action, value = '', cls = '', disabled = false, image = '') {
-  return `<button class="btn ${cls}" data-action="${action}" data-value="${esc(value)}" ${disabled ? 'disabled' : ''}>${image ? icon(image) : ''}${text}</button>`;
+// `reason` explains a disabled button (shown as a tooltip and to screen readers).
+function btn(text, action, value = '', cls = '', disabled = false, image = '', reason = '') {
+  const why = disabled && reason ? ` title="${esc(reason)}" aria-description="${esc(reason)}"` : '';
+  return `<button class="btn ${cls}" data-action="${action}" data-value="${esc(value)}" ${disabled ? 'disabled' : ''}${why}>${image ? icon(image) : ''}${text}</button>`;
 }
 function pill(text, cls = '') {
   return `<span class="pill ${cls}">${esc(text)}</span>`;
@@ -146,13 +148,18 @@ function scans() {
     ['custom', 'folder', 'YOUR CHOICE', 'Choose a specific folder and scan everything inside it.']
   ];
   const disabled = busyEngine() || !capability().canScan;
+  const reason = !capability().canScan
+    ? blockedReason[capability().blocking[0]]
+    : busyEngine()
+      ? 'Wait for the current scan or update to finish.'
+      : '';
   return `<div class="scan-grid">${cards
     .map(([kind, image, tag, desc]) => {
       const tone = kind === 'quick' ? 'green' : kind === 'custom' ? 'purple' : '';
       const button =
         kind === 'custom'
-          ? btn('Choose folder', 'custom', kind, '', disabled, 'arrow')
-          : btn('Start ' + labels[kind].toLowerCase(), 'scan', kind, '', disabled, 'arrow');
+          ? btn('Choose folder', 'custom', kind, '', disabled, 'arrow', reason)
+          : btn('Start ' + labels[kind].toLowerCase(), 'scan', kind, '', disabled, 'arrow', reason);
       return `
         <article class="card scan-card">
           <span class="tag">${tag}</span>
@@ -188,7 +195,7 @@ function activeScan() {
 function operationsNotice() {
   const others = (state.operations || []).filter(o => o.type !== 'scan');
   if (!others.length) return '';
-  return `<div class="notice">In progress: ${others.map(o => esc(o.label)).join(' · ')}</div>`;
+  return `<div class="notice operations">In progress: ${others.map(o => esc(o.label)).join(' · ')}</div>`;
 }
 
 function healthChecks() {
@@ -307,7 +314,8 @@ function overview() {
     metrics +
     `<div class="bottom-grid">
       <section class="card panel">
-        <div class="panel-top"><h2>Health checks</h2><span class="muted">Scheduled and on-demand scanning. Real-time file monitoring is not included.</span></div>
+        <div class="panel-top"><h2>Health checks</h2></div>
+        <p class="muted">Scheduled and on-demand scanning. Real-time file monitoring is not included.</p>
         ${healthChecks()}
       </section>
       <section class="card panel">
@@ -657,11 +665,46 @@ function settings() {
 
 const pages = { overview, scans: scanCenter, schedules, quarantine, activity, settings };
 
+// The header badge is outside the page body, so status changes stay visible even while a report is
+// expanded or a field is being edited, without rebuilding the page (R16).
+function updateHealthBadge() {
+  const el = document.querySelector('#health-badge');
+  if (!el || !state) return;
+  const [text, tone] = healthPill[state.health.state];
+  el.className = `pill header-health ${tone}`;
+  el.textContent = text;
+  el.title = state.health.headline;
+}
+
+// Unsaved schedule or preference edits are never discarded silently (R16).
+const editsSettings = () => current === 'schedules' || current === 'settings';
+const dirty = () => editsSettings() && draft && JSON.stringify(draft) !== JSON.stringify(state.settings);
+let pendingNavigation = null;
+function askAboutUnsavedChanges(destination) {
+  pendingNavigation = destination;
+  if (document.querySelector('#unsaved')) return;
+  document
+    .querySelector('#main')
+    .insertAdjacentHTML(
+      'afterbegin',
+      `<div id="unsaved" class="notice warn unsaved" role="alert"><span>You have unsaved changes on this page.</span><span class="row">${btn('Save and continue', 'unsaved-save', '', 'small primary')}${btn('Discard changes', 'unsaved-discard', '', 'small')}${btn('Stay here', 'unsaved-stay', '', 'small')}</span></div>`
+    );
+  window.scrollTo(0, 0);
+}
+function navigate(value) {
+  current = value;
+  pendingNavigation = null;
+  draft = structuredClone(state.settings);
+  render();
+  window.scrollTo(0, 0);
+}
+
 function render() {
   if (!state) return;
   stale = false;
   document.querySelector('#crumb').textContent = views.find(v => v[0] === current)[2];
   document.querySelector('#app-version').textContent = 'v' + state.version;
+  updateHealthBadge();
   const badge = unresolved().length;
   document.querySelector('#nav').innerHTML = views
     .map(
@@ -707,11 +750,23 @@ document.addEventListener('click', async event => {
   if (!button) return;
   const { action, value } = button.dataset;
   if (action === 'navigate') {
-    current = value;
-    draft = structuredClone(state.settings);
-    render();
-    window.scrollTo(0, 0);
-    return;
+    if (value !== current && dirty()) return askAboutUnsavedChanges(value);
+    return navigate(value);
+  }
+  if (action === 'unsaved-stay') {
+    pendingNavigation = null;
+    return document.querySelector('#unsaved')?.remove();
+  }
+  if (action === 'unsaved-discard') return navigate(pendingNavigation);
+  if (action === 'unsaved-save') {
+    try {
+      await call('settings', draft);
+      state = await call('state');
+      toast('Your preferences are saved.');
+      return navigate(pendingNavigation);
+    } catch (err) {
+      return toast(err.message);
+    }
   }
   const key = action + ':' + value;
   if (pending.has(key)) return;
@@ -746,6 +801,7 @@ window.sentinel.subscribe((kind, data) => {
   }
   state = data;
   if (!draft) draft = structuredClone(state.settings);
+  updateHealthBadge();
   renderWhenIdle();
 });
 
