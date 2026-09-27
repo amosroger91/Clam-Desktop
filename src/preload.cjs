@@ -1,9 +1,15 @@
 const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('sentinel', {
   call: (action, payload) => ipcRenderer.invoke('sentinel', action, payload),
+  // callback(kind, data): 'state' carries the full state, 'progress' only the live scan/update fields.
   subscribe: callback => {
-    const handler = (_, state) => callback(state);
-    ipcRenderer.on('state', handler);
-    return () => ipcRenderer.removeListener('state', handler);
+    const onState = (_, data) => callback('state', data);
+    const onProgress = (_, data) => callback('progress', data);
+    ipcRenderer.on('state', onState);
+    ipcRenderer.on('progress', onProgress);
+    return () => {
+      ipcRenderer.removeListener('state', onState);
+      ipcRenderer.removeListener('progress', onProgress);
+    };
   }
 });

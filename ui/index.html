@@ -1,18 +1,43 @@
 <!doctype html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'">
-  <title>Sentinel AV</title><link rel="stylesheet" href="styles.css">
-</head>
-<body>
-  <aside class="sidebar">
-    <div class="brand"><img src="../assets/icon.png" alt=""><div>sentinel<span>SECURITY, SIMPLIFIED</span></div></div>
-    <div class="workspace"><span class="device-dot"></span> Personal device <span class="windows">⊞</span></div>
-    <div class="nav-label">WORKSPACE</div><nav id="nav"></nav>
-    <div class="sidebar-bottom"><div class="engine-indicator"><span class="device-dot"></span><div>Powered by ClamAV<small>Open source. On your side.</small></div></div><div class="version">SENTINEL AV <span>v1.0.0</span></div></div>
-  </aside>
-  <div class="shell"><header><div class="breadcrumb">Personal workspace <span>/</span> <strong id="crumb">Overview</strong></div><div class="header-right"><span class="local-label">◉ &nbsp; On-device scanning</span><span class="avatar">PC</span></div></header><main id="main"></main><footer><span>ClamAV scanning • Your files stay on this device</span><span>Windows desktop edition</span></footer></div>
-  <div id="toast" role="status" aria-live="polite"></div>
-  <script src="app.js"></script>
-</body></html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'"
+    />
+    <title>Sentinel AV</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <aside class="sidebar">
+      <div class="brand">
+        <img src="../assets/icon.png" alt="" />
+        <div>sentinel<span>SECURITY, SIMPLIFIED</span></div>
+      </div>
+      <div class="workspace"><span class="device-dot"></span> Personal device <span class="windows">⊞</span></div>
+      <div class="nav-label">WORKSPACE</div>
+      <nav id="nav"></nav>
+      <div class="sidebar-bottom">
+        <div class="engine-indicator">
+          <span class="device-dot"></span>
+          <div>Powered by ClamAV<small>Open source. On your side.</small></div>
+        </div>
+        <div class="version">SENTINEL AV <span id="app-version"></span></div>
+      </div>
+    </aside>
+    <div class="shell">
+      <header>
+        <div class="breadcrumb">Personal workspace <span>/</span> <strong id="crumb">Overview</strong></div>
+        <div class="header-right">
+          <span class="local-label">◉ &nbsp; On-device scanning</span><span class="avatar">PC</span>
+        </div>
+      </header>
+      <main id="main"></main>
+      <footer><span>ClamAV scanning • Your files stay on this device</span><span>Windows desktop edition</span></footer>
+    </div>
+    <div id="toast" role="status" aria-live="polite"></div>
+    <script src="app.js"></script>
+  </body>
+</html>
