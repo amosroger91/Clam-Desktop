@@ -14,7 +14,7 @@ const detectionStore = require('./detections.cjs');
 const { createQuarantine } = require('./quarantine.cjs');
 const { startScan, reportStatus } = require('./scanner.cjs');
 const databaseInfo = require('./database.cjs');
-const { assess, classifyUpdateFailure } = require('./health.cjs');
+const { assess, capability, classifyUpdateFailure } = require('./health.cjs');
 const { identify } = require('./files.cjs');
 
 app.setAppUserModelId('com.wellspring.sentinel');
@@ -61,7 +61,9 @@ if (!app.requestSingleInstanceLock()) {
     progressTimer = null;
 
   const busy = () => !!(active || update || installation);
-  const ready = () => engine.runnable && database.present && database.verified !== false;
+  // Execution policy comes from the same capability snapshot the UI and tray show (R01).
+  const currentCapability = () => capability({ engine, database, now: new Date(), settings });
+  const ready = () => currentCapability().canScan;
   const withWindow = fn => {
     if (win && !win.isDestroyed()) return fn(win);
   };
@@ -296,41 +298,97 @@ if (!app.requestSingleInstanceLock()) {
     return engine;
   }
 
-  // Reads database headers immediately, then verifies signatures in the background. The result is cached
-  // until the database files change.
+  // Reads database headers immediately, then verifies signatures in the background. Verification and
+  // load results are cached per database generation *and* engine identity (R01.4), and a check that was
+  // superseded by a database change is re-run for the new generation (R15).
+  const engineKey = () => `${engine.dir || ''}|${engine.version || ''}`;
   let verifying = null;
+  function databaseCache(info) {
+    const cached = updates.database;
+    return cached?.fingerprint === info.fingerprint && cached.engine === engineKey() ? cached : null;
+  }
   function refreshDatabase() {
     const info = databaseInfo.inspect(db);
-    const cached = updates.database;
+    const cached = databaseCache(info);
+    const sigtool = engine.installed ? path.join(engine.dir, 'sigtool.exe') : null;
     database = {
       ...info,
-      verified: cached?.fingerprint === info.fingerprint ? cached.verified : null,
-      failures: cached?.fingerprint === info.fingerprint ? cached.failures : [],
-      loadFailed: cached?.fingerprint === info.fingerprint ? !!cached.loadFailed : false
+      verified: cached?.verified ?? null,
+      failures: cached?.failures ?? [],
+      loadFailed: !!cached?.loadFailed,
+      verifyUnavailable: !!sigtool && !fs.existsSync(sigtool)
     };
     if (info.unreadable.length) Object.assign(database, { verified: false, failures: info.unreadable });
-    else if (database.verified === null && info.present && engine.installed && !verifying) {
-      const sigtool = path.join(engine.dir, 'sigtool.exe');
-      if (!fs.existsSync(sigtool)) return;
-      const fingerprint = info.fingerprint;
-      verifying = databaseInfo
-        .verify(info.files, sigtool, (exe, args) => run(exe, args, { timeout: 120000 }))
-        .then(result => {
-          if (databaseInfo.inspect(db).fingerprint !== fingerprint) return;
-          updates.database = { fingerprint, ...result, verifiedAt: new Date().toISOString() };
-          Object.assign(database, result);
-          persistQuietly('updates');
-        })
-        .catch(() => {})
-        .finally(() => {
-          verifying = null;
-          publish(true);
-        });
-    }
+    else if (database.verified === null && info.present && sigtool && !database.verifyUnavailable) verifyDatabase(info);
+  }
+  function verifyDatabase(info) {
+    if (verifying) return verifying;
+    const sigtool = path.join(engine.dir, 'sigtool.exe');
+    const key = engineKey();
+    verifying = databaseInfo
+      .verify(info.files, sigtool, (exe, args) => run(exe, args, { timeout: 120000 }))
+      .then(result => {
+        if (databaseInfo.inspect(db).fingerprint !== info.fingerprint || engineKey() !== key) return;
+        const loadFailed = databaseCache(info)?.loadFailed ?? database.loadFailed;
+        updates.database = {
+          fingerprint: info.fingerprint,
+          engine: key,
+          ...result,
+          loadFailed,
+          verifiedAt: new Date().toISOString()
+        };
+        Object.assign(database, result);
+        persistQuietly('updates');
+      })
+      .catch(() => {})
+      .finally(() => {
+        verifying = null;
+        // The files changed while being checked: verify the generation that is there now.
+        refreshDatabase();
+        publish(true);
+      });
+    return verifying;
   }
   function recordDatabaseLoad(failed) {
     database.loadFailed = failed;
-    if (updates.database?.fingerprint === database.fingerprint) updates.database.loadFailed = failed;
+    const cached = databaseCache(database);
+    updates.database = cached
+      ? { ...cached, loadFailed: failed }
+      : {
+          fingerprint: database.fingerprint,
+          engine: engineKey(),
+          verified: database.verified,
+          failures: database.failures,
+          loadFailed: failed
+        };
+  }
+  // Repair path for a database ClamAV failed to load (R01.3): re-verify signatures, then run a
+  // controlled load by scanning a small harmless file with this exact database.
+  async function recheckDatabase() {
+    if (busy()) throw Error('Wait for the current operation to finish.');
+    if (!engine.runnable) throw Error('Set up ClamAV first.');
+    refreshDatabase();
+    if (!database.present) throw Error('The signature database is missing. Update the definitions.');
+    if (updates.database && updates.database.fingerprint === database.fingerprint) updates.database.verified = null;
+    database.verified = null;
+    if (!database.verifyUnavailable) await verifyDatabase(databaseInfo.inspect(db));
+    const sample = path.join(root, 'load-check.txt');
+    fs.writeFileSync(sample, 'Sentinel database load check. This file is harmless.');
+    let loaded;
+    try {
+      await run(path.join(engine.dir, 'clamscan.exe'), ['--no-summary', '--database=' + db, sample], {
+        timeout: 300000
+      });
+      loaded = true;
+    } catch (err) {
+      loaded = err.code === 1; // exit 1 means a match, which still proves the database loaded
+    } finally {
+      fs.rmSync(sample, { force: true });
+    }
+    recordDatabaseLoad(!loaded);
+    persistQuietly('updates');
+    publish(true);
+    if (!loaded) throw Error('ClamAV still cannot load this database. Update the definitions to replace it.');
   }
 
   // ---- Signature updates ----
@@ -408,6 +466,15 @@ if (!app.requestSingleInstanceLock()) {
     if (!result.ok) throw Error(updates.failure.message);
   }
 
+  const BLOCKING_MESSAGES = {
+    'engine-missing': 'Set up ClamAV in Settings before scanning.',
+    'engine-not-runnable': 'ClamAV could not start. Check the installation in Settings.',
+    'database-missing': 'Download the signature database before scanning.',
+    'database-invalid': 'The signature database failed verification. Update the definitions before scanning.',
+    'database-load-failed': 'ClamAV could not load the signature database. Recheck or update it before scanning.'
+  };
+  const blockingMessage = reason => BLOCKING_MESSAGES[reason] || 'Scanning is not available right now.';
+
   // ---- Scanning ----
   async function targetsFor(kind, custom, signal) {
     if (kind === 'custom') return custom;
@@ -464,7 +531,8 @@ if (!app.requestSingleInstanceLock()) {
     if (!['quick', 'full', 'custom'].includes(kind)) throw Error('Unknown scan type.');
     if (shuttingDown) throw Error('Sentinel is closing.');
     if (busy()) throw Error('Another operation is already running.');
-    if (!ready()) throw Error('Set up ClamAV and download verified signatures before scanning.');
+    const cap = currentCapability();
+    if (!cap.canScan) throw Error(blockingMessage(cap.blocking[0]));
     const started = new Date();
     const report = {
       id: crypto.randomUUID(),
@@ -1004,6 +1072,7 @@ if (!app.requestSingleInstanceLock()) {
       quarantine: id => quarantineDetection(id),
       restore: id => restoreRecord(id),
       'quarantine-resolve': payload => resolveQuarantine(payload),
+      'recheck-database': () => recheckDatabase(),
       'resolve-detection': id => {
         const d = detections.find(x => x.id === id && x.status === 'missing');
         if (!d) throw Error('Only detections whose file is missing can be marked resolved.');

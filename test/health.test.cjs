@@ -168,3 +168,81 @@ test('inspection reports missing and unreadable databases, and verification uses
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- R01: one capability snapshot drives execution policy and every reassuring statement ----
+const { capability } = require('../src/health.cjs');
+
+test('R01: an unverified database never produces an ok state or a "verified" label', () => {
+  const pending = assess(healthy({ database: { ...healthy().database, verified: null } }));
+  assert.notEqual(pending.state, 'ok');
+  assert.doesNotMatch(check(pending, 'database').detail, /\(verified\)/);
+});
+
+test('R01: capability and health agree across every engine/database combination', () => {
+  const bools = [true, false];
+  let combos = 0;
+  for (const installed of bools)
+    for (const runnable of bools)
+      for (const present of bools)
+        for (const age of ['fresh', 'stale', 'unknown'])
+          for (const verified of [true, false, null])
+            for (const unavailable of bools)
+              for (const loadFailed of bools) {
+                if (runnable && !installed) continue;
+                if (verified !== null && unavailable) continue;
+                combos++;
+                const engine = { installed, runnable, version: 'ClamAV 1.5.4' };
+                const database = {
+                  present,
+                  missing: present ? [] : ['main'],
+                  version: 1,
+                  buildTime: { fresh: '2026-09-27T06:00:00.000Z', stale: '2026-09-01T06:00:00.000Z', unknown: null }[
+                    age
+                  ],
+                  verified,
+                  verifyUnavailable: unavailable,
+                  failures: verified === false ? ['daily.cvd'] : [],
+                  loadFailed
+                };
+                const cap = capability({ engine, database, now, settings: { staleAfterDays: 3 } });
+                const h = assess(healthy({ engine, database }));
+                const label = `${JSON.stringify({ installed, runnable, present, age, verified, unavailable, loadFailed })}`;
+                // Execution policy: blocked by anything that makes a scan meaningless or known to fail.
+                assert.equal(cap.canScan, runnable && present && verified !== false && !loadFailed, label);
+                assert.equal(cap.canScan, cap.blocking.length === 0, label);
+                assert.equal(
+                  cap.verification,
+                  verified === true
+                    ? 'verified'
+                    : verified === false
+                      ? 'failed'
+                      : unavailable
+                        ? 'unavailable'
+                        : 'pending',
+                  label
+                );
+                // Every green statement is justified by the same snapshot.
+                if (h.state === 'ok') {
+                  assert.ok(cap.canScan && cap.verification === 'verified' && age === 'fresh', label);
+                  assert.equal(cap.advisory.length, 0, label);
+                }
+                if (/\(verified\)/.test(check(h, 'database').detail)) assert.equal(cap.verification, 'verified', label);
+                if (!cap.canScan) assert.notEqual(h.state, 'ok', label);
+                if (loadFailed && present) assert.equal(check(h, 'database').action, 'recheck', label);
+              }
+  assert.ok(combos > 100);
+});
+
+test('R01: verification pending or unavailable is advisory, stated plainly', () => {
+  const base = healthy().database;
+  const pending = capability({
+    engine: healthy().engine,
+    database: { ...base, verified: null },
+    now,
+    settings: { staleAfterDays: 3 }
+  });
+  assert.equal(pending.canScan, true);
+  assert.deepEqual(pending.advisory, ['verification-pending']);
+  const missingTool = assess(healthy({ database: { ...base, verified: null, verifyUnavailable: true } }));
+  assert.match(check(missingTool, 'database').label, /cannot be verified/);
+});

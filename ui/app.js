@@ -85,6 +85,21 @@ function scheduleText(s) {
   return `${s.frequency === 'daily' ? 'Every day' : 'Every ' + days[s.day]} at ${s.time}`;
 }
 const busyEngine = () => !!state.active || state.updating || !!state.installing;
+// Scan availability comes from the main process's capability snapshot, the same one it enforces.
+const capability = () => state.health.capability;
+const blockedReason = {
+  'engine-missing': 'Set up ClamAV in Settings to start scanning.',
+  'engine-not-runnable': 'ClamAV could not start. Check the installation in Settings.',
+  'database-missing': 'Download the signature database in Settings to start scanning.',
+  'database-invalid': 'The signature database failed verification. Update the definitions to scan again.',
+  'database-load-failed': 'ClamAV could not load the signature database. Recheck or update it to scan again.'
+};
+const verificationText = {
+  verified: 'verified by sigtool',
+  pending: 'verification in progress',
+  unavailable: 'cannot be verified (no sigtool)',
+  failed: 'failed verification'
+};
 const unresolved = () => state.detections.filter(d => d.status === 'detected' || d.status === 'missing');
 const detectionById = id => state.detections.find(d => d.id === id);
 const statusTone = { ok: '', off: 'amber', warn: 'amber', error: 'red' };
@@ -130,7 +145,7 @@ function scans() {
     ['full', 'monitor', 'THOROUGH CHECK', 'Scan all local fixed drives for a comprehensive review.'],
     ['custom', 'folder', 'YOUR CHOICE', 'Choose a specific folder and scan everything inside it.']
   ];
-  const disabled = busyEngine() || !state.engine.runnable;
+  const disabled = busyEngine() || !capability().canScan;
   return `<div class="scan-grid">${cards
     .map(([kind, image, tag, desc]) => {
       const tone = kind === 'quick' ? 'green' : kind === 'custom' ? 'purple' : '';
@@ -173,7 +188,16 @@ function healthChecks() {
   const actionFor = check => {
     if (!check.action || check.status === 'ok') return '';
     if (check.action === 'update')
-      return btn('Update now', 'update', '', 'small', busyEngine() || !state.engine.installed, 'refresh');
+      return btn('Update now', 'update', '', 'small', busyEngine() || !capability().canUpdate, 'refresh');
+    if (check.action === 'recheck')
+      return btn(
+        'Recheck database',
+        'recheck-database',
+        '',
+        'small',
+        busyEngine() || !state.engine.runnable,
+        'refresh'
+      );
     return btn('Review', 'navigate', check.action, 'small');
   };
   return `<div class="checks">${state.health.checks
@@ -202,9 +226,11 @@ function overview() {
   const action =
     h.state === 'setup'
       ? btn('Set up protection', 'navigate', 'settings', 'primary', false, 'arrow')
-      : firstAction && firstAction.action !== 'update'
-        ? btn('Review', 'navigate', firstAction.action, 'primary', false, 'arrow')
-        : btn('Run quick scan', 'scan', 'quick', 'primary', busyEngine() || !state.engine.runnable, 'scan');
+      : firstAction?.action === 'recheck'
+        ? btn('Recheck database', 'recheck-database', '', 'primary', busyEngine(), 'refresh')
+        : firstAction && firstAction.action !== 'update'
+          ? btn('Review', 'navigate', firstAction.action, 'primary', false, 'arrow')
+          : btn('Run quick scan', 'scan', 'quick', 'primary', busyEngine() || !capability().canScan, 'scan');
 
   const hero = `
     <section class="hero ${h.state}">
@@ -247,9 +273,7 @@ function overview() {
           : db.present
             ? 'Date unknown'
             : 'Not downloaded',
-      db.version
-        ? `Version ${db.version} · ${db.verified === true ? 'verified' : db.verified === false ? 'failed verification' : 'not yet verified'}`
-        : 'Downloaded during setup'
+      db.version ? `Version ${db.version} · ${verificationText[capability().verification]}` : 'Downloaded during setup'
     )
   }</div>`;
 
@@ -291,9 +315,7 @@ function overview() {
 function scanCenter() {
   return (
     heading('Scan center', 'A quick check or a closer look. You’re in control.') +
-    (!state.engine.runnable
-      ? `<div class="notice warn">Finish engine setup in Settings before starting your first scan.</div>`
-      : '') +
+    (!capability().canScan ? `<div class="notice warn">${blockedReason[capability().blocking[0]]}</div>` : '') +
     activeScan() +
     scans() +
     `<div class="notice scan-progress">Full scans inspect accessible files on local fixed drives. Windows permissions and ClamAV limits can prevent files from being scanned; review warnings in the scan report.</div>`
@@ -524,11 +546,10 @@ function engineSection() {
               ['Definitions built', db.buildTime ? date(db.buildTime) : 'Unknown'],
               [
                 'Signature check',
-                db.verified === true
-                  ? 'Verified by sigtool'
-                  : db.verified === false
-                    ? 'Failed: ' + esc(db.failures.join(', '))
-                    : 'Not yet verified'
+                capability().verification === 'failed'
+                  ? 'Failed: ' + esc(db.failures.join(', '))
+                  : verificationText[capability().verification] +
+                    (db.loadFailed ? ' · ClamAV could not load it in the last scan' : '')
               ],
               ['Last update check', date(updates.lastCheck)],
               ['Last successful update', date(updates.lastSuccess)],
