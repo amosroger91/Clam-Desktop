@@ -18,6 +18,7 @@ const { identify } = require('./files.cjs');
 const { createJournal } = require('./journal.cjs');
 const logFiles = require('./logs.cjs');
 const { createCoordinator, OperationConflict } = require('./operations.cjs');
+const { assessCoverage, coversTargets } = require('./coverage.cjs');
 const { loadState, applyScan, verifyLinks, SPECS, SAVE_ORDER } = require('./state.cjs');
 
 app.setAppUserModelId('com.wellspring.sentinel');
@@ -532,21 +533,24 @@ if (!app.requestSingleInstanceLock()) {
 
   // ---- Scanning ----
   const SCAN_NAMES = { quick: 'quick scan', full: 'full scan', custom: 'custom scan' };
+  // Quick-scan locations, including redirected known folders reported by Windows.
+  function quickTargets() {
+    return [
+      ...new Set(
+        ['Desktop', 'Downloads', 'Documents']
+          .map(n => path.join(os.homedir(), n))
+          .concat(
+            app.getPath('desktop'),
+            app.getPath('documents'),
+            app.getPath('downloads'),
+            process.env.TEMP || os.tmpdir()
+          )
+      )
+    ].filter(p => fs.existsSync(p));
+  }
   async function targetsFor(kind, custom, signal) {
     if (kind === 'custom') return custom;
-    if (kind === 'quick')
-      return [
-        ...new Set(
-          ['Desktop', 'Downloads', 'Documents']
-            .map(n => path.join(os.homedir(), n))
-            .concat(
-              app.getPath('desktop'),
-              app.getPath('documents'),
-              app.getPath('downloads'),
-              process.env.TEMP || os.tmpdir()
-            )
-        )
-      ].filter(p => fs.existsSync(p));
+    if (kind === 'quick') return quickTargets();
     const output = await run(
       'powershell.exe',
       [
@@ -604,7 +608,9 @@ if (!app.requestSingleInstanceLock()) {
       started: report.started,
       engineVersion: report.engineVersion,
       databaseVersion: report.databaseVersion,
-      options: report.options
+      options: report.options,
+      // The scope actually in force, so coverage claims can be checked against it later (R03.2).
+      exclusions: [...settings.exclusions]
     };
     let writer;
     try {
@@ -715,8 +721,34 @@ if (!app.requestSingleInstanceLock()) {
         error = 'The scan was stopped because detections could not be saved: ' + evidence.failure;
         addStorageIssue({ file: 'journal', message: error });
       }
+      // Coverage is separate from process outcome (R03): what was inspected, and what was not.
+      const coverage = assessCoverage({
+        status,
+        targets: evidence.targets,
+        warnings: result.warnings,
+        warningCount: result.warningCount
+      });
+      if (coverage.targetFailures.length && coverage.targetFailures.length === evidence.targets.length) {
+        status = 'error';
+        error ??= 'None of the scan locations could be read.';
+      }
+      // A full scan settles a pending quick scan only if its evidence shows the quick locations were inspected.
+      const coversQuick =
+        evidence.header.kind === 'full' &&
+        coversTargets(
+          {
+            status,
+            targets: evidence.targets,
+            warnings: result.warnings,
+            warningCount: result.warningCount,
+            exclusions: evidence.header.exclusions
+          },
+          quickTargets(),
+          { sameExclusions: settings.exclusions }
+        );
       const outcome = {
         status,
+        coverage,
         finished: now.toISOString(),
         exitCode: result.exitCode,
         files: result.files,
@@ -725,7 +757,7 @@ if (!app.requestSingleInstanceLock()) {
         logTruncated: !!result.logTruncated,
         logError: result.logError || null,
         error,
-        coversQuick: false
+        coversQuick
       };
       try {
         evidence.writer.append('commit', { outcome });

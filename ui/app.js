@@ -458,12 +458,26 @@ function historyItem(h) {
       <div class="history-detail">
         <p class="path">${h.targets.map(esc).join(' · ')}</p>
         ${h.engineVersion ? `<p>${esc(h.engineVersion)} · definitions version ${esc(h.databaseVersion ?? 'unknown')}</p>` : ''}
+        ${coverageNote(h)}
         ${h.warnings.length ? `<div class="notice warn">${h.warnings.map(esc).join('<br>')}${warnings > h.warnings.length ? `<br>…and ${warnings - h.warnings.length} more in the scan log.` : ''}</div>` : ''}
         ${h.logTruncated ? '<p>The scan log reached its size limit and was truncated.</p>' : ''}
         ${threats}
         <div class="row">${btn('Export report', 'export', h.id, 'small', false, 'download')}</div>
       </div>
     </details>`;
+}
+
+// What the scan actually inspected, stated without more certainty than the evidence supports.
+function coverageNote(h) {
+  const c = h.coverage;
+  if (!c) return '';
+  const text = {
+    complete: 'Coverage: every file ClamAV reached in these locations was scanned, with no read problems reported.',
+    gaps: `Coverage: completed with gaps. ${c.categories.access} file(s) could not be read${c.categories.limit ? ` and ${c.categories.limit} hit ClamAV size or archive limits` : ''}; see the warnings below.`,
+    incomplete: `Coverage: incomplete. These locations could not be scanned: ${c.targetFailures.map(esc).join(', ')}.`,
+    failed: 'Coverage: the scan did not finish, so these locations were not fully checked.'
+  }[c.status];
+  return `<div class="notice ${c.status === 'complete' ? '' : 'warn'}">${text}${c.warningsTruncated ? ' Only the first warnings are listed here; the scan log has all of them.' : ''}</div>`;
 }
 
 function activity() {
