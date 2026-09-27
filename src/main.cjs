@@ -17,6 +17,7 @@ const { assess, capability, classifyUpdateFailure } = require('./health.cjs');
 const { identify } = require('./files.cjs');
 const { createJournal } = require('./journal.cjs');
 const logFiles = require('./logs.cjs');
+const { createCoordinator, OperationConflict } = require('./operations.cjs');
 const { loadState, applyScan, verifyLinks, SPECS, SAVE_ORDER } = require('./state.cjs');
 
 app.setAppUserModelId('com.wellspring.sentinel');
@@ -71,7 +72,9 @@ if (!app.requestSingleInstanceLock()) {
   let lastEmit = 0,
     progressTimer = null;
 
-  const busy = () => !!(active || update || installation);
+  // Every scan, update, install, database check, file operation, and hashing pass runs through the
+  // coordinator, which enforces the conflict matrix and lets shutdown wait for running work (R08).
+  const operations = createCoordinator();
   // Execution policy comes from the same capability snapshot the UI and tray show (R01).
   const currentCapability = () => capability({ engine, database, now: new Date(), settings });
   const ready = () => currentCapability().canScan;
@@ -251,6 +254,7 @@ if (!app.requestSingleInstanceLock()) {
       engine,
       health: health(),
       active,
+      operations: operations.active(),
       updating: !!update,
       installing: !!installation,
       updateOutput,
@@ -363,8 +367,11 @@ if (!app.requestSingleInstanceLock()) {
     if (info.unreadable.length) Object.assign(database, { verified: false, failures: info.unreadable });
     else if (database.verified === null && info.present && sigtool && !database.verifyUnavailable) verifyDatabase(info);
   }
-  function verifyDatabase(info) {
+  function verifyDatabase(info, owned = false) {
     if (verifying) return verifying;
+    // Never verify while definitions are being replaced; the update refreshes and re-verifies afterwards.
+    const op = owned ? null : operations.tryBegin('verify', 'Verifying definitions');
+    if (!owned && !op) return Promise.resolve();
     const sigtool = path.join(engine.dir, 'sigtool.exe');
     const key = engineKey();
     verifying = databaseInfo
@@ -385,6 +392,7 @@ if (!app.requestSingleInstanceLock()) {
       .catch(() => {})
       .finally(() => {
         verifying = null;
+        op?.end();
         // The files changed while being checked: verify the generation that is there now.
         refreshDatabase();
         publish(true);
@@ -406,14 +414,16 @@ if (!app.requestSingleInstanceLock()) {
   }
   // Repair path for a database ClamAV failed to load (R01.3): re-verify signatures, then run a
   // controlled load by scanning a small harmless file with this exact database.
-  async function recheckDatabase() {
-    if (busy()) throw Error('Wait for the current operation to finish.');
+  function recheckDatabase() {
+    return operations.run('verify', 'Rechecking definitions', recheckDatabaseNow);
+  }
+  async function recheckDatabaseNow() {
     if (!engine.runnable) throw Error('Set up ClamAV first.');
     refreshDatabase();
     if (!database.present) throw Error('The signature database is missing. Update the definitions.');
     if (updates.database && updates.database.fingerprint === database.fingerprint) updates.database.verified = null;
     database.verified = null;
-    if (!database.verifyUnavailable) await verifyDatabase(databaseInfo.inspect(db));
+    if (!database.verifyUnavailable) await verifyDatabase(databaseInfo.inspect(db), true);
     const sample = path.join(root, 'load-check.txt');
     fs.writeFileSync(sample, 'Sentinel database load check. This file is harmless.');
     let loaded;
@@ -439,9 +449,11 @@ if (!app.requestSingleInstanceLock()) {
     if (updates.nextAttempt && now < new Date(updates.nextAttempt)) return false;
     return !updates.lastCheck || now - new Date(updates.lastCheck) > HOUR;
   }
-  async function updateSignatures() {
-    if (shuttingDown) throw Error('Sentinel is closing.');
-    if (active || update) throw Error('Wait for the current operation to finish.');
+  // `owned` is set when an install already holds the operation that covers this update.
+  function updateSignatures({ owned = false } = {}) {
+    return owned ? runUpdate() : operations.run('update', 'Updating definitions', runUpdate);
+  }
+  async function runUpdate() {
     if (!engine.installed) throw Error('Set up ClamAV in Settings first.');
     const exe = path.join(engine.dir, 'freshclam.exe');
     const config = path.join(root, 'freshclam.conf');
@@ -471,7 +483,8 @@ if (!app.requestSingleInstanceLock()) {
       }
       update.proc = proc;
       const append = data => {
-        output += data.toString();
+        // Only a bounded tail is kept for classifying failures (R13).
+        output = (output + data.toString()).slice(-65536);
         updateOutput = (updateOutput + '\n' + data.toString()).slice(-12000);
         publish();
       };
@@ -518,6 +531,7 @@ if (!app.requestSingleInstanceLock()) {
   const blockingMessage = reason => BLOCKING_MESSAGES[reason] || 'Scanning is not available right now.';
 
   // ---- Scanning ----
+  const SCAN_NAMES = { quick: 'quick scan', full: 'full scan', custom: 'custom scan' };
   async function targetsFor(kind, custom, signal) {
     if (kind === 'custom') return custom;
     if (kind === 'quick')
@@ -556,10 +570,9 @@ if (!app.requestSingleInstanceLock()) {
   // the scan finishes; `job` links a scheduled occurrence to its outcome.
   async function scan(kind, custom, job = null) {
     if (!['quick', 'full', 'custom'].includes(kind)) throw Error('Unknown scan type.');
-    if (shuttingDown) throw Error('Sentinel is closing.');
-    if (busy()) throw Error('Another operation is already running.');
     const cap = currentCapability();
     if (!cap.canScan) throw Error(blockingMessage(cap.blocking[0]));
+    const op = operations.begin('scan', (job ? 'Scheduled ' : '') + SCAN_NAMES[kind]);
     const started = new Date();
     const report = {
       id: crypto.randomUUID(),
@@ -593,8 +606,14 @@ if (!app.requestSingleInstanceLock()) {
       databaseVersion: report.databaseVersion,
       options: report.options
     };
-    const writer = journal.begin(report.id, header);
-    const evidence = { writer, header, targets: [], detections: [], failure: null };
+    let writer;
+    try {
+      writer = journal.begin(report.id, header);
+    } catch (err) {
+      op.end();
+      throw err;
+    }
+    const evidence = { writer, header, targets: [], detections: [], failure: null, op };
     active = report;
     const control = { abort: new AbortController(), cancelReason: null };
     let finished;
@@ -733,6 +752,7 @@ if (!app.requestSingleInstanceLock()) {
       // Cleanup happens even if recording the result failed.
       active = null;
       activeScan = null;
+      evidence.op.end();
       if (persistQuietly(...SAVE_ORDER)) journal.remove(report.id);
       withWindow(w => w.setProgressBar(-1));
       publish(true);
@@ -752,10 +772,12 @@ if (!app.requestSingleInstanceLock()) {
 
   // Records size and hash for new detections so quarantine can confirm it acts on the same file. A file
   // that has already disappeared is marked missing rather than treated as clean.
-  let identifying = false;
   async function identifyDetections() {
-    if (identifying) return;
-    identifying = true;
+    const op = operations.tryBegin('identify', 'Recording file identity');
+    if (!op) {
+      if (!operations.isClosed()) setTimeout(identifyDetections, 5000).unref();
+      return;
+    }
     try {
       for (const d of detections.filter(x => x.status === 'detected' && !x.sha256 && !x.identifyError)) {
         try {
@@ -770,7 +792,7 @@ if (!app.requestSingleInstanceLock()) {
       persistQuietly('detections');
       publish(true);
     } finally {
-      identifying = false;
+      op.end();
     }
   }
 
@@ -790,9 +812,9 @@ if (!app.requestSingleInstanceLock()) {
     try {
       const now = new Date();
       if (scheduler.advance(settings.schedules, scheduleRuntime, now)) persistQuietly('schedule');
-      if (busy() || !engine.runnable) return;
+      if (!engine.runnable) return;
       const job = scheduler.nextJob(settings.schedules, scheduleRuntime, now);
-      if (job && ready()) {
+      if (job && ready() && !operations.conflictsWith('scan')) {
         job.started = now.toISOString();
         scheduler.recordStart(scheduleRuntime, job, now);
         try {
@@ -805,11 +827,11 @@ if (!app.requestSingleInstanceLock()) {
           notify('Scheduled scan could not start', err.message, 'schedule');
           publish(true);
         }
-      } else if (updateDue(now)) {
+      } else if (updateDue(now) && !operations.conflictsWith('update')) {
         try {
           await updateSignatures();
         } catch (err) {
-          notify('Signature update needs attention', err.message, 'update');
+          if (!(err instanceof OperationConflict)) notify('Signature update needs attention', err.message, 'update');
         }
       }
     } finally {
@@ -851,8 +873,14 @@ if (!app.requestSingleInstanceLock()) {
     return answer.response;
   }
 
+  // Explains up front why a file operation cannot start (R16), before a dialog is shown.
+  function assertFileOperationAllowed() {
+    const blocker = operations.conflictsWith('file');
+    if (blocker) throw Error(`Wait for “${blocker.label}” to finish.`);
+  }
+
   async function quarantineDetection(id) {
-    if (active) throw Error('Wait for the scan to finish before quarantining files.');
+    assertFileOperationAllowed();
     const d = detections.find(x => x.id === id);
     if (!d || d.status !== 'detected') throw Error('This detection is no longer awaiting review.');
     const response = await confirm({
@@ -862,7 +890,11 @@ if (!app.requestSingleInstanceLock()) {
       detail: d.path + '\n\nThis moves the file to Sentinel’s quarantine. Programs using it may stop working.'
     });
     if (response !== 1) return;
+    // Permission is acquired after the dialog and the detection re-checked, since a scan may have started
+    // or the detection changed while the dialog was open (R08.3).
+    const op = operations.begin('file', 'Quarantining a file');
     try {
+      if (d.status !== 'detected') throw Error('This detection is no longer awaiting review.');
       const record = await quarantine.quarantine(d);
       if (record.saveError) notify('Quarantine completed, but was not saved', record.saveError);
       if (record.status === 'recovery-needed')
@@ -874,11 +906,13 @@ if (!app.requestSingleInstanceLock()) {
       }
       throw err;
     } finally {
+      op.end();
       publish(true);
     }
   }
 
   async function restoreRecord(id) {
+    assertFileOperationAllowed();
     const r = quarantineRecords.find(q => q.id === id && q.status === 'quarantined');
     if (!r) throw Error('This file is no longer in quarantine.');
     const occupied = fs.existsSync(r.original);
@@ -902,13 +936,14 @@ if (!app.requestSingleInstanceLock()) {
       target = chosen.filePath;
     }
     try {
-      await quarantine.restore(id, target);
+      await operations.run('file', 'Restoring a file', () => quarantine.restore(id, target));
     } finally {
       publish(true);
     }
   }
 
   async function resolveQuarantine({ id, action }) {
+    assertFileOperationAllowed();
     const r = quarantineRecords.find(q => q.id === id && q.status === 'recovery-needed');
     if (!r) throw Error('This item no longer needs review.');
     if (action !== 'dismiss') {
@@ -923,7 +958,7 @@ if (!app.requestSingleInstanceLock()) {
       if (response !== 1) return;
     }
     try {
-      await quarantine.resolve(id, action);
+      await operations.run('file', 'Resolving a quarantine review', () => quarantine.resolve(id, action));
     } finally {
       publish(true);
     }
@@ -931,9 +966,8 @@ if (!app.requestSingleInstanceLock()) {
 
   // ---- Installation ----
   async function installEngine() {
-    if (shuttingDown) throw Error('Sentinel is closing.');
-    if (busy()) throw Error('Another operation is already running.');
     if (engine.runnable) throw Error('ClamAV is already installed.');
+    const op = operations.begin('install', 'Installing ClamAV');
     const abort = new AbortController();
     let finished;
     installation = { abort, done: new Promise(resolve => (finished = resolve)) };
@@ -957,7 +991,7 @@ if (!app.requestSingleInstanceLock()) {
         );
       installOutput = 'Engine installed. Downloading the signature database…';
       publish(true);
-      await updateSignatures();
+      await updateSignatures({ owned: true });
       installOutput = 'Setup complete. ClamAV and its signature database are ready.';
     } catch (err) {
       installOutput = abort.signal.aborted
@@ -966,6 +1000,7 @@ if (!app.requestSingleInstanceLock()) {
       throw abort.signal.aborted ? Error('Setup was cancelled.') : err;
     } finally {
       installation = null;
+      op.end();
       finished();
       publish(true);
     }
@@ -985,6 +1020,7 @@ if (!app.requestSingleInstanceLock()) {
   function shutdown() {
     if (shutdownPromise) return shutdownPromise;
     shuttingDown = true;
+    operations.close(); // no new operation is accepted from here on
     clearInterval(tickTimer);
     const waits = [];
     if (activeScan) {
@@ -999,6 +1035,8 @@ if (!app.requestSingleInstanceLock()) {
       installation.abort.abort();
       waits.push(installation.done);
     }
+    // File operations and hashing are awaited too; anything still running at the limit is journaled.
+    waits.push(operations.drain(SHUTDOWN_TIMEOUT));
     shutdownPromise = Promise.race([
       Promise.allSettled(waits),
       new Promise(resolve => setTimeout(resolve, SHUTDOWN_TIMEOUT))
@@ -1113,7 +1151,7 @@ if (!app.requestSingleInstanceLock()) {
         publish(true);
       },
       engine: async () => {
-        if (busy()) throw Error('Wait for the current operation to finish.');
+        if (operations.conflictsWith('install')) throw Error('Wait for the current operation to finish.');
         const selected = await dialog.showOpenDialog(dialogParent(), {
           title: 'Select clamscan.exe in your ClamAV installation',
           properties: ['openFile'],
@@ -1121,9 +1159,11 @@ if (!app.requestSingleInstanceLock()) {
         });
         if (selected.canceled) return;
         if (path.basename(selected.filePaths[0]).toLowerCase() !== 'clamscan.exe') throw Error('Select clamscan.exe.');
-        settings.engineDir = path.dirname(selected.filePaths[0]);
-        persist('settings');
-        await detectEngine();
+        await operations.run('install', 'Changing the ClamAV installation', async () => {
+          settings.engineDir = path.dirname(selected.filePaths[0]);
+          persist('settings');
+          await detectEngine();
+        });
       },
       exclude: async () => {
         const selected = await dialog.showOpenDialog(dialogParent(), {
@@ -1148,7 +1188,7 @@ if (!app.requestSingleInstanceLock()) {
       'quarantine-resolve': payload => resolveQuarantine(payload),
       'quarantine-recheck': async id => {
         try {
-          await quarantine.recheck(id);
+          await operations.run('file', 'Rechecking a quarantine item', () => quarantine.recheck(id));
         } finally {
           publish(true);
         }

@@ -184,6 +184,13 @@ function activeScan() {
     </section>`;
 }
 
+// Background work other than the scan card: what is happening now, so waiting actions make sense.
+function operationsNotice() {
+  const others = (state.operations || []).filter(o => o.type !== 'scan');
+  if (!others.length) return '';
+  return `<div class="notice">In progress: ${others.map(o => esc(o.label)).join(' · ')}</div>`;
+}
+
 function healthChecks() {
   const actionFor = check => {
     if (!check.action || check.status === 'ok') return '';
@@ -295,6 +302,7 @@ function overview() {
       pill('WINDOWS DESKTOP', 'neutral')
     ) +
     hero +
+    operationsNotice() +
     activeScan() +
     metrics +
     `<div class="bottom-grid">
