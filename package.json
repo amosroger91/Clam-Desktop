@@ -1,6 +1,6 @@
 {
   "name": "sentinel-av",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "A considered Windows desktop companion for ClamAV",
   "author": "WellSpring Studio",
   "license": "MIT",
