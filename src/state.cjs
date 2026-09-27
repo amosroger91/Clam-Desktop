@@ -92,6 +92,8 @@ function applyScan(state, replay, now) {
     engineVersion: h.engineVersion,
     databaseVersion: h.databaseVersion,
     options: h.options,
+    // The scope in force when the scan ran, so its coverage claims can be checked (R03.2).
+    exclusions: h.exclusions || [],
     ...(outcome || {
       status: 'interrupted',
       finished: now.toISOString(),

@@ -67,6 +67,15 @@ test('R08: drain is bounded and reports what is still running', async () => {
   );
 });
 
+test('Q1: status listeners are told when operations start and end', () => {
+  let changes = 0;
+  const c = createCoordinator({ onChange: () => changes++ });
+  const op = c.begin('identify');
+  op.end();
+  op.end();
+  assert.equal(changes, 2);
+});
+
 test('R08: run() always ends its operation, and tryBegin reports conflicts without throwing', async () => {
   const c = createCoordinator();
   await assert.rejects(

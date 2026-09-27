@@ -1,61 +1,73 @@
 # Sentinel AV · Clam Desktop
 
-A Windows Electron desktop companion for ClamAV. Includes a polished dashboard, first-run engine installation, hourly malware definition updates, configurable scan schedules, system tray controls, notifications, scan reports, exclusions, and manual quarantine/restore.
+A Windows desktop companion for the open-source [ClamAV](https://www.clamav.net) antivirus engine. It sets up ClamAV for you, keeps its malware definitions up to date, runs daily and weekly scans on a schedule, and gives you a clear place to review and quarantine anything it finds.
 
 ![Sentinel AV dashboard](assets/dashboard.png)
 
-## Run locally
+## Download for Windows
+
+**[Download Sentinel AV 1.2.0 for Windows (x64)](https://github.com/amosroger91/Clam-Desktop/releases/download/v1.2.0/Sentinel-AV-Setup-1.2.0.exe)** · [release notes and checksum](https://github.com/amosroger91/Clam-Desktop/releases/tag/v1.2.0) · [all releases](https://github.com/amosroger91/Clam-Desktop/releases)
+
+- Windows 10 or 11, 64-bit. No administrator rights needed; it installs for your user account only.
+- **This is a preview release and the installer is not code-signed.** Windows SmartScreen may say it "protected your PC"; choose **More info → Run anyway** only if you downloaded it from the link above. You can compare the file's SHA-256 with the checksum on the release page (`Get-FileHash .\Sentinel-AV-Setup-1.2.0.exe` in PowerShell).
+- After installing, open **Settings → Install ClamAV & set up**. Sentinel downloads the official ClamAV engine for Windows from Cisco Talos, checks its SHA-256 digest, and downloads the signature database. The engine is about 225 MB; the definitions need additional space.
+- Upgrading from an earlier version keeps your settings, schedules, scan history, detections, and quarantined files.
+
+## What it does
+
+- **Scheduled scans:** a daily **quick scan** (Desktop, Downloads, Documents, and your temporary folder, including folders Windows has redirected) and a weekly **full scan** of all local fixed drives. You can change the day, time, and frequency, or pause either one. A **custom scan** checks any folder you choose.
+- **Definitions kept current:** checks for new ClamAV definitions hourly, verifies each database file's digital signature with ClamAV's `sigtool`, and warns when definitions are older than the threshold you choose (3 days by default).
+- **An honest dashboard:** the Overview shows "All checks passed" only when a schedule is on, the definitions are current and verified, and your last scan completed. Otherwise it says what needs attention and offers the next useful action. The same status appears in the tray and in the window header.
+- **Review before anything changes:** detections wait in **Activity → Needs review** until you decide. Nothing is quarantined or deleted automatically.
+- **Careful quarantine and restore:** quarantine confirms it is moving the same file that was detected, and restore never overwrites an existing file (you can restore to another location instead).
+- **Runs in the background:** closing the window keeps Sentinel in the system tray so schedules keep running, and it can start at Windows sign-in.
+
+Sentinel is a **scheduled and on-demand scanner**. It is not a real-time protection driver, a firewall, or a registered Windows Security provider, and it does not disable or replace Microsoft Defender. Scans cannot run while the computer is off or Sentinel is fully closed; a run missed that way happens once Sentinel is running again. ClamAV's file-size and archive limits apply, and scan reports say which locations were fully checked and which had files that could not be read.
+
+## How it keeps your data safe
+
+- **Scans are journaled.** Each detection is written to a durable journal the moment ClamAV reports it. If Sentinel, Windows, or the power fails mid-scan, the next start records the scan as interrupted and keeps every detection it had already found.
+- **Scheduled scans are not silently skipped.** A due scan stays owed until it succeeds. Failures retry after 15 minutes, backing off to every 6 hours, and the Schedules page shows the next attempt. Cancelling a scan yourself does not trigger a surprise rescan. When both scans are due, the full scan runs first, and it counts for the quick scan only if its results show the quick-scan folders were actually checked.
+- **Quarantine never deletes the only copy.** Files are hashed before and after being moved. If anything changes along the way, or Sentinel is interrupted, every copy is kept and the item appears under **Quarantine** for you to finish, undo, recheck, or mark reviewed.
+- **Settings and history survive damage.** Data files are versioned and written atomically, with a verified backup of the previous version. A damaged file is set aside for diagnosis and reported in Settings instead of being silently reset, and a file from a newer version of Sentinel is left untouched.
+- **Faults stop safely.** If Sentinel hits an internal error it stops making changes, saves diagnostics, and exits; the next start recovers and tells you what happened.
+
+## Privacy
+
+Everything stays on your computer. Sentinel has no telemetry, uploads no files, and makes no network requests except downloading the ClamAV engine from Cisco Talos's GitHub releases and updating definitions from the official ClamAV service. Settings, the engine, definitions, detections, quarantined files, and up to 200 scan reports are stored in `%APPDATA%\sentinel-av`. Scan logs (in `logs\scans`) contain local file paths and are removed along with their reports. Sentinel's own data folder is always excluded from scans.
+
+## Build from source
 
 Requires Windows 10/11 and Node.js 22.12 or later.
 
 ```powershell
 npm ci
-npm start
+npm start          # run the app
+npm run dist       # build release\Sentinel-AV-Setup-<version>.exe
 ```
 
-Open **Settings → Install ClamAV & set up**. Sentinel downloads the latest official Cisco Talos Windows ZIP, verifies its published SHA-256 digest, installs it in your user profile, and runs FreshClam to download the database. The engine download is approximately 225 MB; definitions require additional space. No administrator access is required. You can also select an existing `clamscan.exe` installation.
-
-## Build a Windows installer
+## Tests
 
 ```powershell
-npm test
-npm run dist
+npm run format:check
+npm test                  # unit tests
+npm run test:smoke        # Electron smoke scenarios
+npm run test:integration  # real ClamAV exit-code checks (needs prepared fixtures)
 ```
 
-The installer is written to `release/`. It creates desktop and Start menu shortcuts. Installed copies start in the tray at Windows sign-in by default; this can be disabled in Settings. The app has a taskbar icon while open and a notification-area tray icon while running.
+- **`npm test`** covers the scheduler with a controllable clock, quarantine recovery with a simulated crash at every step and injected file mutations, persistence migration with a restart after every saved file, the scan journal and its idempotent replay, the operation conflict matrix, coverage evidence, the health/capability matrix, the scanner adapter with a fake process, and the fatal-fault policy.
+- **`npm run test:smoke`** launches the real app several times:
+  - a standard run covering screens, IPC validation, the unsaved-changes guard, and a verified healthy state;
+  - a launch that exits abruptly after a detection is journaled, then a launch that must recover it;
+  - an uncaught fault that must exit nonzero with diagnostics;
+  - a deliberately failing run, which proves failures are reported.
 
-The build is unsigned. Public distribution should use a trusted Windows signing certificate. No certificate or signing key is included in this repository.
+  The real-engine parts run when `test-output\engine-path.txt` and a downloaded database (`test-output\database\main.cvd`) are present, and are skipped with a visible note otherwise. They use harmless synthetic signatures, never real malware.
 
-## Scanning and updates
+The renderer is sandboxed with context isolation and a restrictive content security policy. Privileged work stays in the main process behind a sender-validated IPC bridge, processes are started with argument arrays rather than shell strings, and scan targets must be absolute paths.
 
-- **Quick scan:** daily at 12:00 local time by default; recursively checks Desktop, Downloads, Documents, and the user's temporary folder.
-- **Full scan:** Sunday at 18:00 by default; recursively checks all local fixed drives accessible to the current user.
-- **Custom scan:** choose a folder with the native Windows picker.
-- Change frequency, day, time, and enabled state independently for both schedules.
-- A due run stays pending until a scan for it succeeds. Runs missed while the computer was off are caught up once when Sentinel is next running. Failed runs retry after 15 minutes, backing off to every 6 hours, and the Schedules page shows the next attempt. Cancelling a scan yourself does not trigger an immediate rescan. A scan interrupted by quitting, sign-out, or a crash is recorded as interrupted and retried shortly after Sentinel runs again.
-- When both schedules are due, the full scan runs first; its success also covers the quick scan. Editing a schedule re-plans it from now. Concurrent scans are prevented. Closing the window keeps the app in the tray by default.
-- FreshClam checks for new definitions hourly while the app is running. Failed checks back off from 15 minutes to 6 hours (at least 4 hours after a rate-limit response), and the delay is kept across restarts. Failures are classified (offline, DNS, rate limit, disk, integrity) and shown in Settings. The first database download is part of setup.
-- Definition freshness is judged by the database's build time, not by when Sentinel last checked. Definitions older than the configured threshold (3 days by default) are reported as outdated. Database files are verified with ClamAV's `sigtool`, and a database ClamAV fails to load is reported as a problem.
-- Database updates and scans do not run concurrently. Scans due during an update run after it finishes.
-- Exit codes, errors, permission warnings, partial results, and cancellations are reported. The UI never shows a fabricated completion percentage.
-- The Overview's health checks come from one model shared with the tray and notifications. It only reports everything as fine when a schedule is enabled, definitions are verified and current, and the last scan succeeded.
+## Project status
 
-Sentinel is an **on-demand and scheduled scanner**, not a real-time file monitoring driver, firewall, or registered Windows Security antivirus provider. It does not disable Microsoft Defender. Scans cannot run while the computer is off or Sentinel is completely quit. ClamAV's default file-size and archive limits apply; “full scan” means all accessible local fixed drives, not guaranteed inspection of every byte.
+Version 1.2.0 addresses the release-blocking findings of the second engineering review ([CLAUDE_10X_QUALITY_REVIEW.md](CLAUDE_10X_QUALITY_REVIEW.md)); the wider backlog is in [CLAUDE_TODO.md](CLAUDE_TODO.md). Not yet done: code signing, automatic app updates, Windows Task Scheduler integration (so schedules run while Sentinel is fully closed), and clean-machine installation testing. Optional YARA, capa, and Loki analysis modules are planned but not included.
 
-## Quarantine and privacy
-
-Detections are reported first and kept in their own store, so an unresolved detection stays in **Activity → Needs review** until you act on it, even after its scan report ages out. A file that disappears is shown as missing, not treated as clean.
-
-Quarantine requires an explicit action and confirmation. Sentinel hashes the file first and refuses if it changed since detection. It then moves the file into the app's data directory under a non-executable extension, verifying copies made across drives before removing the original. Every step is journaled. If Sentinel stops mid-operation, recovery decides what happened from content hashes and never deletes a copy unless identical content is verified elsewhere. Uncertain cases keep every copy and appear under Quarantine for you to finish, undo, or mark reviewed. Restore asks for confirmation, never overwrites an existing file, and offers another location when the original path is taken. Quarantine is storage isolation, not an encrypted or access-controlled sandbox. There is no automatic destructive deletion.
-
-Settings, the engine, signatures, quarantine, detections, schedule state, and up to 200 scan reports live in `%APPDATA%/sentinel-av` (the exact directory is displayed in exclusions). Data files are versioned and written atomically with a backup of the previous version. A damaged or invalid file is kept aside for diagnosis (for example `history.json.corrupt-<time>`) and reported in Settings instead of being silently reset. Plain-text scan logs are retained in its `logs` subfolder for reports that are still kept, and each log is capped at 64 MB. Logs contain local file paths. No telemetry or file uploads are implemented; network traffic is limited to official engine downloads and ClamAV definition services. The application data folder is automatically excluded from scans.
-
-## Development and verification
-
-`npm test` runs unit tests for the scheduler (with a controllable clock), quarantine recovery (with a simulated crash at every step), persistence migration and recovery, the scanner adapter (with a fake process), the health model, input validation, output parsing, exclusion handling, and trusted engine asset selection. `npm run pack` builds an unpacked app. For an Electron smoke test, run `npx electron . --smoke-test`; screenshots and renderer state are written to `test-output/`. When `test-output/engine-path.txt` and a downloaded database (`test-output/database/main.cvd`) are present, it also runs real ClamAV scans against a harmless synthetic signature and quits during a scan to check that it is saved as interrupted. Smoke tests use a temporary profile and do not register startup or run background scans.
-
-The renderer is sandboxed with context isolation and a restrictive CSP. Privileged operations stay in the main process behind a sender-validated IPC bridge. Processes are spawned with argument arrays, not shell-interpolated file paths. The app never accepts an executable path directly from renderer text.
-
-ClamAV is a separate project, distributed under its own licenses. Engine downloads preserve upstream license files. Sentinel is not affiliated with Cisco or the ClamAV team.
-
-References: [ClamAV scanning](https://docs.clamav.net/manual/Usage/Scanning.html), [signature updates](https://docs.clamav.net/manual/Usage/SignatureManagement.html), [official engine releases](https://github.com/Cisco-Talos/clamav/releases), [Electron security](https://www.electronjs.org/docs/latest/tutorial/security).
+ClamAV is a separate project distributed under its own licenses; engine downloads keep the upstream license files. Sentinel is not affiliated with Cisco or the ClamAV team. Sentinel itself is MIT-licensed (see [LICENSE](LICENSE)).

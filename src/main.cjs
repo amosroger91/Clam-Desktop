@@ -76,7 +76,7 @@ if (!app.requestSingleInstanceLock()) {
 
   // Every scan, update, install, database check, file operation, and hashing pass runs through the
   // coordinator, which enforces the conflict matrix and lets shutdown wait for running work (R08).
-  const operations = createCoordinator();
+  const operations = createCoordinator({ onChange: () => publish(true) });
   // Execution policy comes from the same capability snapshot the UI and tray show (R01).
   const currentCapability = () => capability({ engine, database, now: new Date(), settings });
   const ready = () => currentCapability().canScan;

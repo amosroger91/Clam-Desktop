@@ -93,7 +93,10 @@ test('R06: a failed log writer does not affect the evidence journal', async () =
 test('R06: crash right after a detection, then replay twice, yields one interrupted report and one sighting', () => {
   const journal = createJournal(dir);
   const id = crypto.randomUUID();
-  const writer = journal.begin(id, header(id, { scheduleId: 'quick', occurrence: '2026-09-27T10:30:00.000Z' }));
+  const writer = journal.begin(
+    id,
+    header(id, { scheduleId: 'quick', occurrence: '2026-09-27T10:30:00.000Z', exclusions: ['D:\\VMs'] })
+  );
   writer.append('targets', { targets: ['C:\\Users\\A\\Downloads'] });
   writer.append('progress', { files: 1200 });
   writer.append('detection', { eventId: 'e1', path: 'C:\\a.exe', signature: 'Win.Test', at: now.toISOString() });
@@ -107,6 +110,7 @@ test('R06: crash right after a detection, then replay twice, yields one interrup
   assert.deepEqual(state, snapshot, 'replay is idempotent');
   assert.equal(first.status, 'interrupted');
   assert.equal(first.files, 1200);
+  assert.deepEqual(first.exclusions, ['D:\\VMs'], 'the report keeps the scope it ran with');
   assert.equal(state.detections.length, 1);
   assert.equal(state.detections[0].sightings, 1);
   assert.equal(state.reports.length, 1);

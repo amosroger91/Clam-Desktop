@@ -28,7 +28,8 @@ class OperationConflict extends Error {
   }
 }
 
-function createCoordinator({ now = () => new Date() } = {}) {
+// `onChange` is called whenever an operation starts or ends, so status displays never go stale.
+function createCoordinator({ now = () => new Date(), onChange = () => {} } = {}) {
   const running = new Map();
   let closed = false;
   let waiters = [];
@@ -42,8 +43,10 @@ function createCoordinator({ now = () => new Date() } = {}) {
     if (blocker) throw new OperationConflict(`Wait for “${blocker.label}” to finish.`, 'conflict');
     const op = { id: crypto.randomUUID(), type, label, started: now().toISOString() };
     running.set(op.id, op);
+    onChange();
     op.end = () => {
       if (!running.delete(op.id)) return;
+      onChange();
       if (!running.size) {
         waiters.forEach(resolve => resolve());
         waiters = [];

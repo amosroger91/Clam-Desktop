@@ -69,8 +69,31 @@ async function prepareEngine(app) {
 
 // Runs real scans when a previously downloaded engine and database are available: a full scan lifecycle
 // with a harmless synthetic detection, then a shutdown during a scan, which must be saved as interrupted.
+async function waitFor(condition, ms) {
+  const deadline = Date.now() + ms;
+  while (!condition() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 200));
+  return condition();
+}
+
+// A clean scan with verified definitions must produce the "all checks passed" state. The capture is
+// also the README screenshot, so it shows the real app in a genuinely verified state.
+async function checkHealthyState(app) {
+  const clean = path.join(testRoot, 'fixtures-clean');
+  fs.mkdirSync(clean, { recursive: true });
+  fs.writeFileSync(path.join(clean, 'clean.txt'), 'An ordinary document for the clean scan check.');
+  await app.scan('custom', [clean]);
+  await waitFor(() => !app.isScanning(), 180000);
+  const verified = await waitFor(() => app.state().database.verified === true, 120000);
+  const state = app.state();
+  if (!verified || state.health.state !== 'ok')
+    throw Error('Healthy state was not reached: ' + JSON.stringify({ verified, health: state.health.headline }));
+  await capture(app.win, 'overview', 'readme-dashboard.png');
+  console.log('Healthy state passed: a clean scan with sigtool-verified definitions reports all checks passed.');
+}
+
 async function checkEngine(app) {
   if (!(await prepareEngine(app))) return;
+  await checkHealthyState(app);
   await app.scan('custom', [path.join(testRoot, 'fixtures')]);
   const deadline = Date.now() + 180000;
   while (app.isScanning() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));
