@@ -88,6 +88,8 @@ function createQuarantine({
         signature: detection.signature,
         sha256: found.sha256,
         size: found.size,
+        // Supporting information only; identity is established by the content hash.
+        modified: found.modified,
         created: at(),
         status: 'prepared',
         error: null,

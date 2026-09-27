@@ -69,6 +69,8 @@ test('quarantine moves the file and records its hash', async () => {
   const r = await h.make().quarantine(d);
   assert.equal(r.status, 'quarantined');
   assert.equal(r.sha256, d.sha256);
+  assert.equal(r.size, 'suspicious a.exe'.length);
+  assert.ok(!Number.isNaN(Date.parse(r.modified)));
   assert.ok(!fs.existsSync(d.path));
   assert.equal(read(r.stored), 'suspicious a.exe');
   assert.equal(h.detections[d.id], 'quarantined');
