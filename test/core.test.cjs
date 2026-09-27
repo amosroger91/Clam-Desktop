@@ -41,7 +41,7 @@ test('scan arguments use literal target paths and escape excluded folder regexes
   assert.ok(!regex.test('C:\\Users\\A (test)\\vault-other\\file.exe'));
   assert.ok(!args.some(a => a.startsWith('--remove')));
   for (const target of ['--remove=yes', 'relative\folder', '/C'])
-    assert.throws(() => scanArgs(s, 'C:\database', [target]), /Invalid scan location/);
+    assert.throws(() => scanArgs(s, 'C:\\database', [target]), /Invalid scan location/);
 });
 test('scan output handles Windows drive colons and detection names', () => {
   assert.deepEqual(parseLine('C:\\Users\\test.txt: Win.Test.Signature FOUND'), {

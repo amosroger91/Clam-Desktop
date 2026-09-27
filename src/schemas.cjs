@@ -16,7 +16,22 @@ const T = {
   oneOf:
     (...values) =>
     v =>
-      values.includes(v)
+      values.includes(v),
+  // A SHA-256 hex digest, or null when not yet known.
+  sha: v => v == null || (typeof v === 'string' && /^[a-f0-9]{64}$/.test(v)),
+  uuid: v => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v),
+  // Absolute drive or UNC paths; device namespaces (\\?\, \\.\) and control characters are rejected.
+  winPath: v =>
+    typeof v === 'string' &&
+    v.length < 32768 &&
+    /^([a-z]:[\\/]|[\\/]{2}[^\\/?.])/i.test(v) &&
+    !/[\u0000-\u001f]/.test(v),
+  audit: v =>
+    Array.isArray(v) &&
+    v.length <= 1000 &&
+    v.every(
+      e => e && typeof e === 'object' && typeof e.action === 'string' && (e.at == null || typeof e.at === 'string')
+    )
 };
 
 function invalidField(obj, shape) {
@@ -103,7 +118,9 @@ const REPORT_SHAPE = {
   finished: T.optDate,
   status: T.oneOf(...REPORT_STATUSES),
   files: T.count,
-  threats: v => Array.isArray(v) && v.every(t => T.str(t?.id) && T.str(t?.path) && T.str(t?.signature)),
+  threats: v =>
+    Array.isArray(v) && v.every(t => T.str(t?.id) && T.str(t?.path) && T.str(t?.signature) && T.optStr(t?.detectionId)),
+  warningCount: T.optCount,
   warnings: T.strArray,
   targets: T.strArray
 };
@@ -145,7 +162,9 @@ const detections = {
         lastSeen: T.date,
         sightings: T.count,
         reports: T.strArray,
-        audit: T.array
+        sha256: T.sha,
+        revisions: v => v == null || (Array.isArray(v) && v.every(x => T.sha(x?.sha256))),
+        audit: T.audit
       },
       'detection'
     )
@@ -189,14 +208,19 @@ const quarantine = {
     validList(
       list,
       {
+        // The id and stored path are checked again before any file operation; a record whose stored path
+        // is suspicious is kept (and flagged by the quarantine module) so its vault file stays tracked.
         id: T.str,
         detectionId: T.str,
-        original: T.str,
+        original: T.winPath,
         stored: T.str,
         signature: T.str,
+        sha256: T.sha,
+        storedSha256: T.sha,
         created: T.date,
         status: T.oneOf(...QUARANTINE_STATUSES),
-        audit: T.array
+        options: v => v == null || (Array.isArray(v) && v.every(o => ['finish', 'undo', 'dismiss'].includes(o))),
+        audit: T.audit
       },
       'quarantine record'
     )
@@ -227,7 +251,18 @@ const updates = {
     }
     if (T.count(data.failures)) value.failures = data.failures;
     if (data.failure && T.str(data.failure.message) && T.str(data.failure.kind)) value.failure = data.failure;
-    if (data.database && typeof data.database === 'object') value.database = data.database;
+    const cache = data.database;
+    if (cache != null) {
+      if (
+        T.str(cache.fingerprint) &&
+        T.optStr(cache.engine) &&
+        (cache.verified === null || T.bool(cache.verified)) &&
+        T.strArray(cache.failures ?? []) &&
+        (cache.loadFailed == null || T.bool(cache.loadFailed))
+      )
+        value.database = cache;
+      else problems.push('the database verification cache was malformed and will be rebuilt');
+    }
     return { value, problems };
   }
 };
@@ -274,7 +309,8 @@ const jobs = {
     const current = data?.current;
     if (current != null) {
       const bad = invalidField(current, {
-        reportId: T.str,
+        // Used to locate the scan's log, so it must be a real scan id.
+        reportId: T.uuid,
         kind: T.oneOf('quick', 'full', 'custom'),
         scheduleId: v => v == null || v === 'quick' || v === 'full',
         occurrence: T.optDate,

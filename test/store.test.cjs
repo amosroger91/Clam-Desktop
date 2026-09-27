@@ -346,3 +346,48 @@ test('R07: a file from a newer version is read-only and never overwritten', () =
   );
   assert.equal(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'), newer);
 });
+
+// ---- R11: malformed but parseable values never reach file operations ----
+
+test('R11: malformed-but-parseable records are set aside and loading does not throw', () => {
+  const good = {
+    id: '3f2b8f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b',
+    detectionId: 'd1',
+    original: 'C:\\Users\\A\\x.exe',
+    stored: 'C:\\data\\quarantine\\3f2b8f7e-1c2d-4e5f-8a9b-0c1d2e3f4a5b.quarantine',
+    signature: 'S',
+    sha256: 'a'.repeat(64),
+    created: '2026-09-27T00:00:00.000Z',
+    status: 'quarantined',
+    options: [],
+    audit: [{ at: '2026-09-27T00:00:00.000Z', action: 'moved' }]
+  };
+  const bad = [
+    { ...good, sha256: 'not-a-hash' },
+    { ...good, original: '\\\\?\\C:\\Windows\\x.exe' },
+    { ...good, original: 'relative\\x.exe' },
+    { ...good, original: 'C:/Users/A/forward-slashes.exe', sha256: 'b'.repeat(64) },
+    { ...good, original: '\\\\server\\share\\x.exe', sha256: 'c'.repeat(64) },
+    { ...good, options: ['delete-everything'] },
+    { ...good, audit: [{ at: 5 }] }
+  ];
+  write('quarantine', JSON.stringify({ schema: 1, data: [good, ...bad] }));
+  write(
+    'jobs',
+    JSON.stringify({
+      schema: 1,
+      data: { current: { reportId: '..\\..\\escape', kind: 'quick', started: '2026-09-27T00:00:00.000Z' } }
+    })
+  );
+  write('updates', JSON.stringify({ schema: 1, data: { failures: 0, database: { fingerprint: 5, verified: 'yes' } } }));
+  const q = store.load('quarantine', schemas.quarantine);
+  // The good record plus the valid forward-slash and UNC variants are kept; the five malformed ones are not.
+  assert.equal(q.value.length, 3);
+  assert.equal(q.value[0].original, 'C:\\Users\\A\\x.exe', 'ordinary Windows paths are accepted');
+  assert.match(q.issue.message, /quarantine record 2 had an invalid sha256/);
+  assert.ok(fs.existsSync(q.issue.preservedAs));
+  assert.equal(store.load('jobs', schemas.jobs).value.current, null);
+  const u = store.load('updates', schemas.updates);
+  assert.equal(u.value.database, undefined);
+  assert.match(u.issue.message, /verification cache/);
+});

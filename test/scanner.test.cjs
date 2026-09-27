@@ -192,13 +192,13 @@ test('R05: a log failure under backpressure does not leave output paused', async
     const proc = fakeProcess();
     const sink = stalledLog();
     const scan = start(proc, { fs: { ...fs, createWriteStream: () => sink } });
-    proc.stdout.write('C:\a.txt: OK\n');
+    proc.stdout.write('C:\\a.txt: OK\n');
     await flush();
     assert.equal(proc.stdout.isPaused(), true, 'backpressure pauses stdout');
     sink.destroy(Object.assign(Error('write failed'), { code }));
     await flush();
     assert.equal(proc.stdout.isPaused(), false, 'stdout resumes when the log fails');
-    proc.stdout.write('C:\b.exe: Win.Test FOUND\n');
+    proc.stdout.write('C:\\b.exe: Win.Test FOUND\n');
     await flush();
     proc.emit('close', 1);
     const result = await scan.done;
@@ -224,7 +224,7 @@ test('R05: the log closing before drain resumes output', async () => {
   const proc = fakeProcess();
   const sink = stalledLog();
   const scan = start(proc, { fs: { ...fs, createWriteStream: () => sink } });
-  proc.stdout.write('C:\a.txt: OK\n');
+  proc.stdout.write('C:\\a.txt: OK\n');
   await flush();
   sink.destroy();
   await flush();

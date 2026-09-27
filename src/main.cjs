@@ -865,6 +865,8 @@ if (!app.requestSingleInstanceLock()) {
     try {
       const record = await quarantine.quarantine(d);
       if (record.saveError) notify('Quarantine completed, but was not saved', record.saveError);
+      if (record.status === 'recovery-needed')
+        notify('Quarantine needs your review', record.issue || 'Open Quarantine in Sentinel to decide what to keep.');
     } catch (err) {
       if (err.reason === 'missing') {
         detectionStore.transition(d, 'missing', new Date().toISOString(), 'missing', 'Not found when quarantining.');
@@ -1144,6 +1146,13 @@ if (!app.requestSingleInstanceLock()) {
       quarantine: id => quarantineDetection(id),
       restore: id => restoreRecord(id),
       'quarantine-resolve': payload => resolveQuarantine(payload),
+      'quarantine-recheck': async id => {
+        try {
+          await quarantine.recheck(id);
+        } finally {
+          publish(true);
+        }
+      },
       'recheck-database': () => recheckDatabase(),
       'resolve-detection': id => {
         const d = detections.find(x => x.id === id && x.status === 'missing');

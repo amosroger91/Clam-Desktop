@@ -5,16 +5,28 @@
 // verified to exist elsewhere. When identity or completeness is uncertain, both copies are kept and the
 // record is marked 'recovery-needed' for the user to review.
 //
-// Record statuses: prepared → quarantined (same volume: atomic rename)
+// Record statuses: prepared → quarantined (same volume: atomic rename, then verify what was moved)
 //                  prepared → copying → quarantined (across volumes: copy, verify, then remove original)
 //                  quarantined → restoring → restored
 //                  failed (nothing was moved), recovery-needed (user review), reviewed (user dismissed)
+//
+// Identity (R04): a committed record always describes the bytes actually retained. Content moved into
+// quarantine is hashed after the move; an original is removed only after it has been renamed aside (so
+// later writers at that path create a new file) and the isolated file re-verified. Node cannot take a
+// Windows deny-share lock on a path, so a process that already holds the file open can still write to it
+// until the rename; the post-move verification is what catches that case.
+//
+// Paths (R11): the stored location is always derived from the record's validated id, never trusted from
+// disk. A record whose stored path disagrees is left untouched and flagged for review.
 const nodeFs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { identify, hashFile } = require('./files.cjs');
 
 const MAX_AUDIT = 30;
+const RECORD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Absolute drive or UNC paths only; device namespaces (\\?\, \\.\) are rejected.
+const isUsablePath = p => typeof p === 'string' && path.win32.isAbsolute(p) && !/^[\\/]{2}[?.][\\/]/.test(p);
 
 class QuarantineError extends Error {
   constructor(message, reason) {
@@ -41,7 +53,15 @@ function createQuarantine({
     return run;
   };
   const at = () => now().toISOString();
-  const partialOf = r => r.stored + '.partial';
+  const storedOf = r => path.join(vault, r.id + '.quarantine');
+  // A record may be acted on only if its id is valid and its stored path is the one derived from it.
+  const trusted = r =>
+    RECORD_ID.test(r.id) &&
+    typeof r.stored === 'string' &&
+    path.resolve(r.stored).toLowerCase() === storedOf(r).toLowerCase() &&
+    isUsablePath(r.original);
+  const partialOf = r => storedOf(r) + '.partial';
+  const stagingOf = r => path.join(path.dirname(r.original), `.${path.basename(r.original)}.${r.id}.sentinel-remove`);
   const restoreTempOf = (r, target) =>
     path.join(path.dirname(target), `.${path.basename(target)}.${r.id}.sentinel-restore`);
   const exists = async p =>
@@ -107,9 +127,18 @@ function createQuarantine({
       }
       fault('prepared');
       try {
-        await fs.promises.rename(r.original, r.stored);
+        await fs.promises.rename(r.original, storedOf(r));
         fault('moved');
-        set(r, 'quarantined', 'moved');
+        // Verify what was actually moved: the file may have changed after it was hashed (R04).
+        const kept = await identify(storedOf(r), fs);
+        if (kept?.sha256 === r.sha256) set(r, 'quarantined', 'moved');
+        else
+          set(r, 'recovery-needed', 'changed-during-move', null, {
+            storedSha256: kept?.sha256 ?? null,
+            issue:
+              'The file changed while it was being quarantined. What was moved into quarantine differs from the detected file and was kept for review.',
+            options: ['dismiss']
+          });
       } catch (err) {
         if (err.reason === 'fault') throw err;
         if (err.code !== 'EXDEV') {
@@ -144,29 +173,46 @@ function createQuarantine({
       set(r, 'failed', 'failed', 'Copy verification failed.', { error: 'The quarantine copy could not be verified.' });
       return;
     }
-    await fs.promises.rename(partialOf(r), r.stored);
+    await fs.promises.rename(partialOf(r), storedOf(r));
     fault('copied');
-    const current = await identify(r.original, fs);
-    if (current?.sha256 !== r.sha256) {
+    if (!(await removeVerifiedOriginal(r))) {
       set(r, 'recovery-needed', 'changed-during-copy', null, {
         issue: 'The original file changed while it was being quarantined. Both copies were kept.',
         options: ['dismiss']
       });
       return;
     }
-    await fs.promises.unlink(r.original);
-    fault('removed-original');
     set(r, 'quarantined', 'copied');
+  }
+
+  // Removes the original only if it still holds the detected content (R04.3). It is first renamed aside,
+  // so anything written to the original path afterwards is a new file that is never deleted, and the
+  // isolated file is verified before removal. Unexpected content is put back (or kept beside it).
+  async function removeVerifiedOriginal(r) {
+    const staging = stagingOf(r);
+    await fs.promises.rename(r.original, staging);
+    fault('isolated');
+    const isolated = await identify(staging, fs);
+    if (isolated?.sha256 === r.sha256) {
+      await fs.promises.unlink(staging);
+      fault('removed-original');
+      return true;
+    }
+    if (!(await exists(r.original))) await fs.promises.rename(staging, r.original);
+    return false;
   }
 
   function restore(id, target) {
     return exclusive(async () => {
       const r = records.find(q => q.id === id && q.status === 'quarantined');
       if (!r) throw new QuarantineError('This file is no longer in quarantine.', 'missing');
+      if (!trusted(r))
+        throw new QuarantineError('This record points outside Sentinel’s quarantine, so it was not used.', 'untrusted');
       target = target || r.original;
+      if (!isUsablePath(target)) throw new QuarantineError('That restore location is not supported.', 'invalid-target');
       if (await exists(target))
         throw new QuarantineError('A file already exists at ' + target + '. Choose another location.', 'exists');
-      const stored = await identify(r.stored, fs);
+      const stored = await identify(storedOf(r), fs);
       if (!stored || (r.sha256 && stored.sha256 !== r.sha256))
         throw new QuarantineError('The quarantined copy is missing or has changed, so it was not restored.', 'damaged');
       const temp = restoreTempOf(r, target);
@@ -179,7 +225,7 @@ function createQuarantine({
       }
       try {
         await fs.promises.mkdir(path.dirname(target), { recursive: true });
-        await fs.promises.copyFile(r.stored, temp, fs.constants.COPYFILE_EXCL);
+        await fs.promises.copyFile(storedOf(r), temp, fs.constants.COPYFILE_EXCL);
         fault('restore-copied');
         if ((await hashFile(temp, fs)) !== stored.sha256) throw Error('The restored copy could not be verified.');
         // A hard link publishes the file without ever replacing an existing one. Volumes without
@@ -202,7 +248,7 @@ function createQuarantine({
         );
       }
       await remove(temp);
-      await fs.promises.unlink(r.stored);
+      await fs.promises.unlink(storedOf(r));
       fault('restore-removed');
       set(r, 'restored', 'restored', target);
       persistAfterChange(r);
@@ -216,19 +262,55 @@ function createQuarantine({
     return exclusive(async () => {
       const changed = [];
       for (const r of records) {
-        if (r.status === 'prepared' || r.status === 'copying') await recoverQuarantine(r);
-        else if (r.status === 'restoring') await recoverRestore(r);
-        else continue;
-        changed.push(r);
+        if (!['prepared', 'copying', 'restoring', 'recovery-needed', 'quarantined'].includes(r.status)) continue;
+        if (r.status === 'quarantined' && trusted(r)) continue;
+        const before = JSON.stringify([r.status, r.issue, r.options]);
+        await reconcile(r);
+        if (JSON.stringify([r.status, r.issue, r.options]) !== before) changed.push(r);
       }
       if (changed.length) persistAfterChange(changed[0]);
       return changed;
     });
   }
 
+  // Re-derives a record's state from the files now on disk. Records waiting for review are rechecked too,
+  // so a decision that went stale can be refreshed (R10).
+  async function reconcile(r) {
+    if (!trusted(r)) {
+      if (r.status !== 'recovery-needed' || !r.untrusted)
+        set(r, 'recovery-needed', 'untrusted-record', null, {
+          untrusted: true,
+          issue:
+            'This record’s stored location is outside Sentinel’s quarantine folder, so Sentinel will not act on it. No files were changed.',
+          options: ['dismiss']
+        });
+      return;
+    }
+    if (r.status === 'restoring' || r.interruptedPhase === 'restore') await recoverRestore(r);
+    else await recoverQuarantine(r);
+  }
+
+  function recheck(id) {
+    return exclusive(async () => {
+      const r = records.find(q => q.id === id && ['recovery-needed', 'reviewed'].includes(q.status));
+      if (!r) throw new QuarantineError('This item does not need to be rechecked.', 'stale');
+      await reconcile(r);
+      persistAfterChange(r);
+      return r;
+    });
+  }
+
   async function recoverQuarantine(r) {
+    // A removal interrupted after the original was renamed aside (R04).
+    const staging = stagingOf(r);
+    const staged = await identify(staging, fs);
+    if (staged) {
+      const storedNow = await identify(storedOf(r), fs);
+      if (r.sha256 && staged.sha256 === r.sha256 && storedNow?.sha256 === r.sha256) await remove(staging);
+      else if (!(await exists(r.original))) await fs.promises.rename(staging, r.original);
+    }
     const [stored, original, partial] = await Promise.all([
-      identify(r.stored, fs),
+      identify(storedOf(r), fs),
       identify(r.original, fs),
       exists(partialOf(r))
     ]);
@@ -260,6 +342,8 @@ function createQuarantine({
           error: 'Quarantine was interrupted. The file was left in its original location.'
         });
       } else review('Quarantine was interrupted. An incomplete copy was kept at ' + partialOf(r) + '.');
+    } else if (staged && (await exists(staging))) {
+      review('Quarantine was interrupted while removing the original. The file was kept at ' + staging + '.');
     } else if (original) {
       set(r, 'failed', 'recovered', 'The file had not been moved.', {
         error:
@@ -276,27 +360,31 @@ function createQuarantine({
     const temp = restoreTempOf(r, target);
     const [restored, stored, tempFile] = await Promise.all([
       identify(target, fs),
-      identify(r.stored, fs),
+      identify(storedOf(r), fs),
       identify(temp, fs)
     ]);
     const matches = f => !!f && !!r.sha256 && f.sha256 === r.sha256;
     if (matches(restored)) {
       if (tempFile && matches(tempFile)) await remove(temp);
-      if (matches(stored)) await remove(r.stored);
-      set(r, 'restored', 'recovered', target);
+      if (matches(stored)) await remove(storedOf(r));
+      set(r, 'restored', 'recovered', target, { interruptedPhase: null });
       onDetection(r.detectionId, 'restored', r);
     } else if (matches(stored)) {
       if (tempFile) await remove(temp);
-      set(r, 'quarantined', 'recovered', 'Restore was interrupted; the file is still in quarantine.');
+      set(r, 'quarantined', 'recovered', 'Restore was interrupted; the file is still in quarantine.', {
+        interruptedPhase: null
+      });
     } else if (matches(tempFile)) {
       set(r, 'recovery-needed', 'recovery-needed', null, {
         issue: 'Restore was interrupted. The only verified copy is at ' + temp + '.',
-        options: ['dismiss']
+        options: ['dismiss'],
+        interruptedPhase: 'restore'
       });
     } else {
       set(r, 'recovery-needed', 'recovery-needed', null, {
         issue: 'Restore was interrupted and no verified copy could be found. Nothing was deleted.',
-        options: ['dismiss']
+        options: ['dismiss'],
+        interruptedPhase: 'restore'
       });
     }
   }
@@ -309,18 +397,20 @@ function createQuarantine({
       if (action === 'dismiss') {
         set(r, 'reviewed', 'dismissed', 'Files were left where they are.');
       } else {
-        const [stored, original] = await Promise.all([identify(r.stored, fs), identify(r.original, fs)]);
+        if (!trusted(r)) throw new QuarantineError('This record cannot be acted on.', 'untrusted');
+        const [stored, original] = await Promise.all([identify(storedOf(r), fs), identify(r.original, fs)]);
         if (!stored || !original || stored.sha256 !== r.sha256 || original.sha256 !== r.sha256)
           throw new QuarantineError(
-            'The files changed since this was checked. Restart Sentinel to re-check them.',
+            'The files changed since this was checked. Use Recheck to review them again.',
             'stale'
           );
         if (action === 'finish') {
-          await fs.promises.unlink(r.original);
+          if (!(await removeVerifiedOriginal(r)))
+            throw new QuarantineError('The original changed at the last moment and was kept. Use Recheck.', 'stale');
           set(r, 'quarantined', 'finished');
           onDetection(r.detectionId, 'quarantined', r);
         } else {
-          await fs.promises.unlink(r.stored);
+          await fs.promises.unlink(storedOf(r));
           set(r, 'failed', 'undone', null, {
             error: 'Quarantine was undone. The file was left in its original location.'
           });
@@ -332,7 +422,7 @@ function createQuarantine({
     });
   }
 
-  return { quarantine, restore, recover, resolve };
+  return { quarantine, restore, recover, recheck, resolve };
 }
 
 function friendly(err) {

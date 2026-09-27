@@ -489,6 +489,10 @@ function quarantineItem(q) {
     if (q.options.includes('undo')) actions.push(btn('Undo quarantine', 'quarantine-undo', q.id, 'small'));
     if (q.options.includes('dismiss')) actions.push(btn('Mark reviewed', 'quarantine-dismiss', q.id, 'small'));
   }
+  // Recheck re-reads the files and regenerates the available actions from what is there now.
+  if (q.status === 'recovery-needed' || q.status === 'reviewed') {
+    actions.push(btn('Recheck', 'quarantine-recheck', q.id, 'small', false, 'refresh'));
+  }
   return `
     <div class="history-item">
       <div class="row spread"><h3>${esc(q.signature)}</h3>${pill(label, tone)}</div>
@@ -496,6 +500,7 @@ function quarantineItem(q) {
       <p>${date(q.created)}${q.size != null ? ` · ${q.size.toLocaleString()} bytes` : ''}${q.sha256 ? ` · SHA-256 ${esc(q.sha256.slice(0, 16))}…` : ''}</p>
       ${q.issue ? `<div class="notice warn">${esc(q.issue)}</div>` : ''}
       ${q.error ? `<p>${esc(q.error)}</p>` : ''}
+      ${q.saveError ? `<div class="notice warn">This change could not be saved: ${esc(q.saveError)} Sentinel will reconcile it the next time it starts.</div>` : ''}
       ${q.status === 'restored' && q.restoreTarget && q.restoreTarget !== q.original ? `<p>Restored to <span class="path">${esc(q.restoreTarget)}</span></p>` : ''}
       ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
     </div>`;
