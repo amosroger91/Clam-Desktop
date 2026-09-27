@@ -56,32 +56,48 @@ function startScan({
     warnings: [],
     warningCount: 0,
     databaseError: false,
-    logTruncated: false
+    logTruncated: false,
+    logError: null
   };
   let resolveDone;
   const done = new Promise(resolve => (resolveDone = resolve));
 
-  // Log writing respects backpressure and a size cap; the log never blocks completion.
+  // The diagnostic log respects backpressure and a size cap, but it is never allowed to stall the
+  // scanner: the stream that caused the pressure is paused, and every paused stream resumes on drain,
+  // log failure, log close, or cancellation. Parsing continues when the log is unavailable.
   const log = fs.createWriteStream(logPath);
+  const paused = new Set();
   let logBytes = 0,
-    logFailed = false;
-  log.on('error', err => {
-    logFailed = true;
-    warn('Could not write the scan log: ' + err.message);
-  });
+    logUsable = true;
+  function resumeAll() {
+    for (const stream of paused) stream.resume();
+    paused.clear();
+  }
+  function stopLogging(message) {
+    if (!logUsable) return;
+    logUsable = false;
+    if (message) {
+      result.logError = message;
+      warn('Could not write the scan log: ' + message);
+    }
+    resumeAll();
+  }
+  log.on('drain', resumeAll);
+  log.on('error', err => stopLogging(err.message));
+  log.on('close', () => stopLogging(null));
 
   let proc;
-  function writeLog(chunk) {
-    if (logFailed || result.logTruncated) return;
+  function writeLog(chunk, source) {
+    if (!logUsable || result.logTruncated) return;
     if (logBytes + chunk.length > maxLogBytes) {
       result.logTruncated = true;
       log.write(`\n[Sentinel: log truncated after ${Math.round(maxLogBytes / 1048576)} MB]\n`);
       return;
     }
     logBytes += chunk.length;
-    if (!log.write(chunk) && proc?.stdout?.pause) {
-      proc.stdout.pause();
-      log.once('drain', () => proc.stdout.resume());
+    if (!log.write(chunk) && logUsable && source?.pause) {
+      source.pause();
+      paused.add(source);
     }
   }
 
@@ -111,12 +127,27 @@ function startScan({
   const stdout = lineFramer(t => line(t, false));
   const stderr = lineFramer(t => line(t, true));
   let finished = false,
+    finalized = false,
     killTimer = null;
 
+  // Completion runs once. Output still buffered in a paused stream is parsed before the report is
+  // finalized (bounded, so a stuck stream cannot hold completion forever).
   function finish(exitCode, error) {
     if (finished) return;
     finished = true;
     clearTimeout(killTimer);
+    resumeAll();
+    let turns = 0;
+    const pending = () =>
+      [proc?.stdout, proc?.stderr].some(
+        s => s && !s.readableEnded && ((s.readableLength ?? 0) > 0 || (s.writableLength ?? 0) > 0)
+      );
+    const waitForOutput = () => (pending() && turns++ < 100 ? setImmediate(waitForOutput) : finalize(exitCode, error));
+    waitForOutput();
+  }
+
+  function finalize(exitCode, error) {
+    finalized = true;
     stdout.end();
     stderr.end();
     result.exitCode = exitCode;
@@ -146,12 +177,14 @@ function startScan({
     return { pid: null, cancel: () => {}, done, snapshot: () => result };
   }
   proc.stdout.on('data', chunk => {
-    writeLog(chunk);
+    if (finalized) return;
+    writeLog(chunk, proc.stdout);
     stdout.write(chunk);
     onProgress(result);
   });
   proc.stderr.on('data', chunk => {
-    writeLog(chunk);
+    if (finalized) return;
+    writeLog(chunk, proc.stderr);
     stderr.write(chunk);
     onProgress(result);
   });
@@ -162,6 +195,7 @@ function startScan({
     if (finished || result.cancelReason) return;
     result.cancelReason = reason;
     result.phase = 'cancelling';
+    resumeAll();
     let signalled = false;
     try {
       signalled = proc.kill();
