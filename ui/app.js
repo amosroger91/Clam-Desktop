@@ -274,7 +274,9 @@ function overview() {
       'check',
       'LAST SUCCESSFUL SCAN',
       last ? date(last.finished) : 'None yet',
-      last ? `${labels[last.kind]} · ${last.files.toLocaleString()} files` : 'Run a scan to establish a baseline'
+      last
+        ? `${labels[last.kind]} · ${last.files.toLocaleString()} file${last.files === 1 ? '' : 's'}`
+        : 'Run a scan to establish a baseline'
     ) +
     metric(
       'purple',
