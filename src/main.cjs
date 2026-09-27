@@ -691,7 +691,7 @@ if (!app.requestSingleInstanceLock()) {
           const found = await identify(d.path);
           if (!found)
             detectionStore.transition(d, 'missing', new Date().toISOString(), 'missing', 'The file was not found.');
-          else Object.assign(d, { sha256: found.sha256, size: found.size });
+          else detectionStore.recordIdentity(d, found, new Date().toISOString());
         } catch (err) {
           d.identifyError = err.code || err.message;
         }
