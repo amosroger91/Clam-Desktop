@@ -172,9 +172,14 @@ function startScan({
         resolveDone(result);
       }
     };
+    // A log that already closed or failed will not emit again, so settle now rather than waiting on it.
+    if (!logUsable || log.closed || log.destroyed) return settle();
     log.once('close', settle);
     log.once('error', settle);
-    setTimeout(settle, 3000).unref?.();
+    // Bounded, and deliberately not unref'd: completion must never depend on other work keeping the
+    // process alive.
+    const fallback = setTimeout(settle, 3000);
+    log.once('close', () => clearTimeout(fallback));
     log.end();
   }
 
@@ -210,7 +215,6 @@ function startScan({
     } catch {}
     // A process that ignores the request (or could not be signalled) is force-terminated by PID.
     killTimer = setTimeout(() => forceKill(proc.pid), signalled ? killTimeoutMs : 0);
-    killTimer.unref?.();
   }
 
   return { pid: proc.pid, cancel, done, snapshot: () => result };
