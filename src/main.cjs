@@ -19,6 +19,7 @@ const { createJournal } = require('./journal.cjs');
 const logFiles = require('./logs.cjs');
 const { createCoordinator, OperationConflict } = require('./operations.cjs');
 const { assessCoverage, coversTargets } = require('./coverage.cjs');
+const { createFatalHandler, nextCrashState } = require('./fatal.cjs');
 const { loadState, applyScan, verifyLinks, SPECS, SAVE_ORDER } = require('./state.cjs');
 
 app.setAppUserModelId('com.wellspring.sentinel');
@@ -839,7 +840,7 @@ if (!app.requestSingleInstanceLock()) {
 
   // ---- Scheduler ----
   async function tick() {
-    if (ticking || shuttingDown || smoke) return;
+    if (ticking || shuttingDown || smoke || safeMode) return;
     ticking = true;
     try {
       const now = new Date();
@@ -1080,12 +1081,68 @@ if (!app.requestSingleInstanceLock()) {
     return shutdownPromise;
   }
 
-  process.on('uncaughtException', err => {
+  // ---- Fatal faults (R12) ----
+  // After an uncaught fault the process may hold broken invariants, so it stops mutating, kills its own
+  // child processes, keeps diagnostics, records the crash, and exits nonzero. The next start recovers
+  // from the journals. Crash state is written with plain synchronous writes, independent of the store.
+  const startedAt = new Date().toISOString();
+  const crashFile = path.join(root, 'crash-state.json');
+  const readCrashState = () => {
     try {
-      fs.appendFileSync(path.join(logs, 'app-errors.log'), `${new Date().toISOString()} ${err.stack || err}\n`);
+      return JSON.parse(fs.readFileSync(crashFile, 'utf8'));
+    } catch {
+      return null;
+    }
+  };
+  const writeCrashState = value => {
+    try {
+      fs.writeFileSync(crashFile, JSON.stringify(value, null, 2));
     } catch {}
-    notify('Sentinel encountered an internal error', 'Details were written to the app error log.', 'crash');
+  };
+  const fatal = createFatalHandler({
+    stopMutations: () => {
+      shuttingDown = true;
+      operations.close();
+      clearInterval(tickTimer);
+    },
+    killChildren: () => {
+      if (activeScan?.handle) forceKill(activeScan.handle.pid);
+      if (update?.proc) forceKill(update.proc.pid);
+    },
+    writeDiagnostics: text => logFiles.appendAppError(appLogs, text),
+    markCrash: () =>
+      writeCrashState({
+        ...nextCrashState(readCrashState(), { startedAt, crashedAt: new Date().toISOString() }),
+        acknowledged: false
+      }),
+    exit: code => app.exit(code)
   });
+  process.on('uncaughtException', err => fatal.handle(err, 'uncaughtException'));
+  process.on('unhandledRejection', reason => fatal.handle(reason, 'unhandledRejection'));
+
+  // Reports the previous crash once, and decides whether this launch starts in safe mode.
+  let safeMode = false;
+  function reviewPreviousCrash() {
+    const crash = readCrashState();
+    if (!crash) return;
+    safeMode = !!crash.safeMode;
+    if (!crash.acknowledged)
+      addStorageIssue({
+        file: 'app',
+        message:
+          `Sentinel closed unexpectedly at ${crash.lastCrash}. Details are in logs\\app\\errors.log. ` +
+          'Any scan that was running has been recovered from its journal.' +
+          (safeMode
+            ? ' Automatic scans and updates are paused for this session because Sentinel crashed repeatedly at startup.'
+            : '')
+      });
+    writeCrashState({ ...crash, acknowledged: true });
+    // Staying up past the startup window ends a crash loop.
+    setTimeout(() => {
+      const current = readCrashState();
+      if (current) writeCrashState({ ...current, consecutiveStartupCrashes: 0, safeMode: false });
+    }, 60000).unref();
+  }
 
   app.on('second-instance', show);
   app.whenReady().then(async () => {
@@ -1093,6 +1150,7 @@ if (!app.requestSingleInstanceLock()) {
     logFiles.migrateLayout(logs);
     const firstRun = !fs.existsSync(store.file('settings'));
     loadAll();
+    reviewPreviousCrash();
     quarantine = createQuarantineManager();
     recoverJournals();
     pruneLogs();
@@ -1119,6 +1177,13 @@ if (!app.requestSingleInstanceLock()) {
       }
     });
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    // A renderer crash does not affect scans or file operations in this process: log it and reload the
+    // window a bounded number of times.
+    let rendererReloads = 0;
+    win.webContents.on('render-process-gone', (_, details) => {
+      logFiles.appendAppError(appLogs, `renderer gone: ${details.reason} (exit ${details.exitCode})`);
+      if (rendererReloads++ < 3 && !shuttingDown) setTimeout(() => withWindow(w => w.reload()), 1000);
+    });
     win.webContents.on('will-navigate', (event, url) => {
       if (url !== page) event.preventDefault();
     });
@@ -1302,6 +1367,10 @@ if (!app.requestSingleInstanceLock()) {
         latestReport: () => reports[0],
         // Electron's app.quit() ignores process.exitCode, so the result is passed to app.exit() explicitly
         // after the normal shutdown path has run.
+        throwUncaught: message =>
+          setTimeout(() => {
+            throw Error(message);
+          }),
         quit: code =>
           shutdown().finally(() => {
             shutdownComplete = true;

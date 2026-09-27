@@ -116,6 +116,8 @@ module.exports = function runSmokeTest(win, app) {
     try {
       fs.mkdirSync(testRoot, { recursive: true });
       if (app.mode === 'fail') throw Error('Intentional smoke failure (verifies nonzero exit).');
+      // An uncaught fault must take the fatal path: diagnostics, crash marker, and a nonzero exit.
+      if (app.mode === 'fatal') return app.throwUncaught('Intentional uncaught fault');
       if (app.mode === 'crash-start') return await crashStart(app);
       if (app.mode === 'crash-recover') return await crashRecover(app);
       await checkRenderer(win);

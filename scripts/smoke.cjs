@@ -47,6 +47,19 @@ try {
   fs.rmSync(profile, { recursive: true, force: true });
 }
 
+const fatalProfile = fs.mkdtempSync(path.join(os.tmpdir(), 'sentinel-fatal-'));
+try {
+  const fatal = launch('fatal', { SENTINEL_SMOKE_PROFILE: fatalProfile });
+  const errors = path.join(fatalProfile, 'logs', 'app', 'errors.log');
+  const logged = fs.existsSync(errors) && fs.readFileSync(errors, 'utf8').includes('Intentional uncaught fault');
+  const marked = fs.existsSync(path.join(fatalProfile, 'crash-state.json'));
+  check('an uncaught fault exits nonzero with diagnostics and a crash marker', fatal.status === 1 && logged && marked, [
+    `exit status ${fatal.status}, diagnostics ${logged ? 'kept' : 'missing'}, crash marker ${marked ? 'written' : 'missing'}`
+  ]);
+} finally {
+  fs.rmSync(fatalProfile, { recursive: true, force: true });
+}
+
 const failing = launch('fail');
 check('an intentionally failing scenario exits nonzero', failing.status !== 0, [`exit status ${failing.status}`]);
 
