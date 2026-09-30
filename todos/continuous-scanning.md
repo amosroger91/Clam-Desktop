@@ -12,4 +12,3 @@ Branch: `codex/continuous-scanning`
 - [x] Document behavior, resource tradeoffs, service setup, and remaining limitations.
 
 This implements near-real-time detection, not a Windows interception driver. Existing scheduled and manual scans remain available. No automatic quarantine or deletion is introduced.
-

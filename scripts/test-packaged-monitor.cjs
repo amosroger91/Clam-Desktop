@@ -26,8 +26,10 @@ async function main() {
   };
   let pid;
   try {
+    fs.cpSync(path.resolve('test-output/rules'), path.join(root, 'monitor/rules'), { recursive: true });
     await client.configure({
-      engineDir: fs.readFileSync('test-output/engine-path.txt', 'utf8').trim(),
+      engineDir: path.join(dist, 'resources/engines/clamav'),
+      toolsRoot: path.join(dist, 'resources/engines'),
       database: path.resolve('test-output/database'),
       exclusions: [],
       scanArchives: true,
@@ -37,6 +39,9 @@ async function main() {
       prefs: {
         ...defaults(),
         enabled: true,
+        highRiskOnly: false,
+        yaraEnabled: true,
+        staticAnalysis: true,
         folders: [watched],
         pauseOnBattery: false,
         minFreeMemoryMB: 128,
@@ -51,6 +56,12 @@ async function main() {
     assert.equal(checked.events.length, 0);
     assert.equal(checked.pid, pid);
     assert.ok(checked.resources.freeMB > 0);
+    const pe = await client.call(
+      'scan',
+      { file: path.join(dist, 'resources/monitor/SentinelMonitor.exe'), id: require('node:crypto').randomUUID() },
+      180000
+    );
+    assert.equal(pe.clean, true, 'bundled multi-engine pipeline accepts the benign service host');
     await client.acquire();
     assert.equal((await client.call('status')).engineReady, false);
     await client.release();

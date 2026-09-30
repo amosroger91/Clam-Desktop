@@ -25,6 +25,10 @@ jobs:
         run: npm run test:integration
       - name: Build background process host
         run: npm run build:service
+      - name: Prepare pinned analysis binaries
+        run: npm run prepare:tools
+      - name: Real secondary engines and community rules
+        run: node scripts/test-layers.cjs
       - name: Continuous scanning and restart recovery
         shell: pwsh
         run: |
@@ -35,7 +39,7 @@ jobs:
       - name: Electron smoke scenarios
         run: npm run test:smoke
       - name: Build installer
-        run: npm run dist -- --publish never
+        run: npm run dist
       - uses: actions/upload-artifact@v4
         with:
           name: Sentinel-AV-Windows

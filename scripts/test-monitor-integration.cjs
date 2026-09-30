@@ -21,7 +21,15 @@ async function main() {
     path.join(database, 'test.hdb'),
     crypto.createHash('md5').update(sample).digest('hex') + ':' + sample.length + ':Sentinel.Monitor.Test\n'
   );
-  const prefs = { ...defaults(), enabled: true, folders: [watched], pauseOnBattery: false, settleMs: 500 };
+  const prefs = {
+    ...defaults(),
+    enabled: true,
+    highRiskOnly: false,
+    autoQuarantine: false,
+    folders: [watched],
+    pauseOnBattery: false,
+    settleMs: 500
+  };
   const clamd = new Clamd({
     dir: path.join(root, 'daemon'),
     database,
@@ -72,7 +80,7 @@ async function main() {
     fs.writeFileSync(clean, 'Clean text');
     const detected = path.join(watched, 'sample.txt');
     fs.writeFileSync(detected, sample);
-    assert.deepEqual(await clamd.scan(clean), { clean: true });
+    assert.equal((await clamd.scan(clean)).clean, true);
     assert.match((await clamd.scan(detected)).signature, /^Sentinel\.Monitor\.Test/);
     const pid = clamd.proc.pid;
     await clamd.scan(clean);
@@ -116,7 +124,7 @@ async function main() {
     await call('release', 'test-maintenance');
     await wait(async () => (await call('status')).events.some(e => e.path === another), 'queued work after resume');
     await wait(async () => (await call('status')).active === 0, 'queue drain');
-    assert.deepEqual(await call('scan', { file: clean, id: crypto.randomUUID() }), { clean: true });
+    assert.equal((await call('scan', { file: clean, id: crypto.randomUUID() })).clean, true);
     let hostCrashCleanup = false;
     if (process.env.SENTINEL_TEST_HOST) {
       const beforeCrash = await call('status');
@@ -142,7 +150,34 @@ async function main() {
       assert.ok((await call('status')).events.some(e => e.id === expectedEvent));
       hostCrashCleanup = true;
     }
+    await call('configure', {
+      prefs: { ...prefs, autoQuarantine: true },
+      engineDir,
+      database,
+      exclusions: [],
+      scanArchives: true,
+      detectPUA: false,
+      blocked: false
+    });
+    const autoFile = path.join(watched, 'auto-quarantine.exe');
+    fs.writeFileSync(autoFile, sample);
+    const isolated = await wait(
+      async () => (await call('status')).quarantine.find(r => r.original === autoFile && r.status === 'quarantined'),
+      'automatic quarantine'
+    );
+    assert.equal(fs.existsSync(autoFile), false);
+    assert.deepEqual(fs.readFileSync(isolated.stored), sample);
+    await stop();
+    launch();
+    await wait(() => call('status'), 'automatic quarantine restart');
+    assert.ok((await call('status')).quarantine.some(r => r.id === isolated.id && r.status === 'quarantined'));
+    await call('lease', { id: 'restore-test' });
+    const restored = path.join(watched, 'restored.exe');
+    await call('auto-restore', { id: isolated.id, target: restored });
+    assert.deepEqual(fs.readFileSync(restored), sample);
     const result = {
+      automaticQuarantine: true,
+      automaticRestore: true,
       realEngine: true,
       persistentEngine: true,
       watchedDetectionMs: latencyMs,

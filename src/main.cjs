@@ -83,6 +83,7 @@ if (!app.requestSingleInstanceLock()) {
       scanArchives: settings.scanArchives,
       detectPUA: settings.detectPUA,
       autoUpdate: settings.autoUpdate,
+      toolsRoot: app.isPackaged ? path.join(process.resourcesPath, 'engines') : path.join(__dirname, '../vendor'),
       verifiedFingerprint: database.verified === true ? database.fingerprint : null,
       blocked: !ready()
     };
@@ -127,12 +128,35 @@ if (!app.requestSingleInstanceLock()) {
         persist(...SAVE_ORDER);
         journal.remove(event.id);
         await monitor.call('ack', [event.id]);
-        notify('Threat detected', event.signature + '\n' + event.path);
+        notify(
+          event.quarantineStatus === 'quarantined'
+            ? 'Threat quarantined'
+            : event.action === 'review'
+              ? 'Suspicious file needs review'
+              : 'Threat detected',
+          event.signature +
+            '\n' +
+            event.path +
+            (event.quarantineError ? '\nQuarantine failed: ' + event.quarantineError : '')
+        );
       }
+      let quarantineChanged = JSON.stringify(monitoring.quarantine) !== JSON.stringify(next.quarantine);
+      for (const record of next.quarantine || []) {
+        const d = detections.find(d => d.id === record.detectionId || d.reports.includes(record.detectionId));
+        if (d && ['quarantined', 'restored'].includes(record.status) && d.status !== record.status) {
+          detectionStore.transition(d, record.status, record.updated || record.created, 'automatic-' + record.status);
+          d.autoQuarantineId = record.id;
+          d.sha256 = record.sha256;
+          d.size = record.size;
+          persist('detections');
+          if (record.status === 'quarantined') notify('Threat quarantined', record.signature + '\n' + record.original);
+        }
+      }
+      monitoring = { ...monitoring, quarantine: next.quarantine || [] };
       if (next.events?.length) {
         identifyDetections();
         publish(true);
-      }
+      } else if (quarantineChanged) publish(true);
       if (next.definitionVersion && next.definitionVersion !== database.fingerprint) refreshDatabase();
       delete next.events;
       monitoring = next;
@@ -351,7 +375,7 @@ if (!app.requestSingleInstanceLock()) {
       settings,
       history: reports,
       detections,
-      quarantine: quarantineRecords,
+      quarantine: [...quarantineRecords, ...(monitoring.quarantine || []).map(r => ({ ...r, automatic: true }))],
       schedule: {
         runtime: scheduleRuntime,
         upcoming: scheduler.upcoming(settings.schedules, scheduleRuntime, new Date())
@@ -431,6 +455,7 @@ if (!app.requestSingleInstanceLock()) {
   async function detectEngine() {
     const candidates = [
       settings.engineDir,
+      ...(app.isPackaged ? [path.join(process.resourcesPath, 'engines/clamav')] : []),
       path.join(process.env.ProgramFiles || 'C:\\Program Files', 'ClamAV'),
       'C:\\ClamAV',
       ...(process.env.PATH || '').split(path.delimiter)
@@ -1087,7 +1112,8 @@ if (!app.requestSingleInstanceLock()) {
 
   async function restoreRecord(id) {
     assertFileOperationAllowed();
-    const r = quarantineRecords.find(q => q.id === id && q.status === 'quarantined');
+    const automatic = (monitoring.quarantine || []).find(q => q.id === id);
+    const r = automatic || quarantineRecords.find(q => q.id === id && q.status === 'quarantined');
     if (!r) throw Error('This file is no longer in quarantine.');
     const occupied = fs.existsSync(r.original);
     const response = await confirm({
@@ -1110,7 +1136,11 @@ if (!app.requestSingleInstanceLock()) {
       target = chosen.filePath;
     }
     try {
-      await operations.run('file', 'Restoring a file', () => withMonitorPaused(() => quarantine.restore(id, target)));
+      await operations.run('file', 'Restoring a file', () =>
+        withMonitorPaused(() =>
+          automatic ? monitor.call('auto-restore', { id, target }) : quarantine.restore(id, target)
+        )
+      );
     } finally {
       publish(true);
     }
@@ -1118,7 +1148,8 @@ if (!app.requestSingleInstanceLock()) {
 
   async function resolveQuarantine({ id, action }) {
     assertFileOperationAllowed();
-    const r = quarantineRecords.find(q => q.id === id && q.status === 'recovery-needed');
+    const automatic = (monitoring.quarantine || []).find(q => q.id === id);
+    const r = automatic || quarantineRecords.find(q => q.id === id && q.status === 'recovery-needed');
     if (!r) throw Error('This item no longer needs review.');
     if (action !== 'dismiss') {
       const response = await confirm({
@@ -1133,7 +1164,9 @@ if (!app.requestSingleInstanceLock()) {
     }
     try {
       await operations.run('file', 'Resolving a quarantine review', () =>
-        withMonitorPaused(() => quarantine.resolve(id, action))
+        withMonitorPaused(() =>
+          automatic ? monitor.call('auto-resolve', { id, action }) : quarantine.resolve(id, action)
+        )
       );
     } finally {
       publish(true);
@@ -1200,6 +1233,8 @@ if (!app.requestSingleInstanceLock()) {
     clearInterval(tickTimer);
     clearInterval(monitorTimer);
     const waits = [];
+    if (!smoke && monitor.connected() && !settings?.monitoring.keepRunning && !monitoring.service)
+      waits.push(monitor.call('stop').catch(() => {}));
     if (activeScan) {
       cancelScan('shutdown');
       waits.push(activeScan.done);
@@ -1388,7 +1423,13 @@ if (!app.requestSingleInstanceLock()) {
         store.save('settings', next, SPECS.settings.version);
         settings = next;
         if (settings.monitoring.enabled && !settings.monitoring.folders.length)
-          settings.monitoring.folders = quickTargets();
+          settings.monitoring.folders = [
+            ...new Set([
+              app.getPath('downloads'),
+              os.tmpdir(),
+              path.join(process.env.SystemRoot || 'C:\\Windows', 'Temp')
+            ])
+          ].filter(p => fs.existsSync(p));
         persist('settings');
         await configureMonitor();
         scheduleRuntime = runtime;
@@ -1447,7 +1488,13 @@ if (!app.requestSingleInstanceLock()) {
       'quarantine-resolve': payload => resolveQuarantine(payload),
       'quarantine-recheck': async id => {
         try {
-          await operations.run('file', 'Rechecking a quarantine item', () => quarantine.recheck(id));
+          await operations.run('file', 'Rechecking a quarantine item', () =>
+            withMonitorPaused(() =>
+              (monitoring.quarantine || []).some(q => q.id === id)
+                ? monitor.call('auto-recheck', { id })
+                : quarantine.recheck(id)
+            )
+          );
         } finally {
           publish(true);
         }

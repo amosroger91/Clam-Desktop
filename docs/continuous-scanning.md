@@ -1,8 +1,8 @@
 # Continuous scanning
 
-Enable **Settings → Continuous scanning & resources → Monitor file changes**, choose folders and save. If no folders are selected, Sentinel uses its quick-scan locations. Monitoring is off by default so an upgrade does not silently start consuming additional memory or inspecting new folders.
+Enable **Settings → Continuous scanning & resources → Monitor file changes**, choose folders and save. If no folders are selected, Sentinel uses Downloads and user/system Temp. Monitoring is off by default. The high-risk filter defaults to executables, installers, scripts and archives; turn it off to inspect all extensions.
 
-This is near-real-time detection after a file changes, not execution prevention. It does not register as a Windows Security provider, install a kernel filter, replace Microsoft Defender, or automatically quarantine anything.
+This is near-real-time detection after a file changes, not execution prevention. Confirmed ClamAV threats are automatically quarantined unless that option is disabled. PUA/heuristic and secondary-engine findings require review. It does not register as a Windows Security provider, install a kernel filter or replace Microsoft Defender.
 
 ## How it works
 
@@ -44,7 +44,7 @@ Quarantine during a directory scan offers **Stop scan and quarantine**. The fore
 
 ## Background lifetime and definitions
 
-The agent continues monitoring after the desktop exits. Desktop alerts are delivered while the desktop is running; detections found while it is closed are retained and presented when it reconnects. Scheduled quick/full scans still belong to the desktop scheduler. Enable launch at sign-in, or install the optional service, to restart monitoring after a reboot.
+On normal quit the desktop stops its agent and daemon unless **Continue after quitting Sentinel** is enabled. An installed Windows service runs independently. Desktop alerts are delivered while the desktop is running; detections found while it is closed are retained and presented when it reconnects. Scheduled quick/full scans still belong to the desktop scheduler. Enable launch at sign-in, or install the optional service, to restart monitoring after a reboot.
 
 With automatic updates enabled, the agent checks definitions hourly when the desktop heartbeat is absent, with persisted failure backoff and signature verification. It stops its engine during updates. If the desktop requests a maintenance lease, the background updater is cancelled before the lease is granted. A failed update that changed the database blocks scanning until the definitions are successfully verified or replaced.
 

@@ -19,7 +19,7 @@ function fixture(t, options = {}) {
   let time = Date.now() + 100000,
     saved;
   const queue = new MonitorQueue({
-    prefs: { ...defaults(), enabled: true, settleMs: 500 },
+    prefs: { ...defaults(), enabled: true, highRiskOnly: false, settleMs: 500 },
     folders: [dir],
     exclusions: [],
     scan: async () => ({ clean: true }),

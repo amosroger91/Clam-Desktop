@@ -2,6 +2,12 @@ const path = require('node:path');
 
 const defaults = () => ({
   enabled: false,
+  highRiskOnly: true,
+  autoQuarantine: true,
+  yaraEnabled: false,
+  staticAnalysis: false,
+  telemetryEnabled: false,
+  keepRunning: false,
   folders: [],
   concurrency: 1,
   settleMs: 1500,
@@ -19,6 +25,18 @@ const defaults = () => ({
 function validate(input, previous = defaults()) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw Error('Invalid monitoring preferences.');
   const out = { ...defaults(), ...previous };
+  for (const key of [
+    'highRiskOnly',
+    'autoQuarantine',
+    'yaraEnabled',
+    'staticAnalysis',
+    'telemetryEnabled',
+    'keepRunning'
+  ]) {
+    if (input[key] !== undefined && typeof input[key] !== 'boolean')
+      throw Error('Invalid monitoring preference: ' + key);
+    if (input[key] !== undefined) out[key] = input[key];
+  }
   for (const key of ['enabled', 'pauseOnBattery', 'idleOnly', 'lowPriority']) {
     if (typeof input[key] !== 'boolean') throw Error('Invalid monitoring preference: ' + key);
     out[key] = input[key];

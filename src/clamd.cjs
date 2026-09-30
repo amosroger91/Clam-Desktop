@@ -5,8 +5,9 @@ const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
+const crypto = require('node:crypto');
 
-function command(port, text, { timeout = 120000, signal, stream } = {}) {
+function command(port, text, { timeout = 120000, signal, stream, onChunk = () => {} } = {}) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) return reject(Error('Scan cancelled'));
     const socket = net.createConnection({ host: '127.0.0.1', port });
@@ -39,6 +40,7 @@ function command(port, text, { timeout = 120000, signal, stream } = {}) {
         if (stream) {
           for await (const chunk of stream) {
             if (settled) return;
+            onChunk(chunk);
             const length = Buffer.alloc(4);
             length.writeUInt32BE(chunk.length);
             if (!socket.write(Buffer.concat([length, chunk]))) await once(socket, 'drain');
@@ -152,12 +154,15 @@ class Clamd {
   async scan(file, { signal } = {}) {
     await this.start();
     // INSTREAM scans the bytes of an open file; paths never enter the command protocol.
-    const result = await command(this.port, 'INSTREAM', { signal, stream: fs.createReadStream(file) });
-    if (result === 'stream: OK') return { clean: true };
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(file);
+    const result = await command(this.port, 'INSTREAM', { signal, stream, onChunk: chunk => hash.update(chunk) });
+    const sha256 = hash.digest('hex');
+    if (result === 'stream: OK') return { clean: true, sha256 };
     const found = /^stream: (.+) FOUND$/.exec(result);
     if (found) {
       if (found[1].startsWith('Heuristics.Limits.Exceeded')) throw Error('Scan limit exceeded: ' + found[1]);
-      return { clean: false, signature: found[1] };
+      return { clean: false, signature: found[1], sha256 };
     }
     throw Error(result || 'ClamAV returned no verdict');
   }
@@ -166,6 +171,11 @@ class Clamd {
     this.ready = false;
     const child = this.proc;
     if (!child || child.exitCode !== null) return;
+    await command(this.port, 'SHUTDOWN', { timeout: 1000 }).catch(() => {});
+    if (child.exitCode !== null) {
+      this.proc = null;
+      return;
+    }
     await new Promise(resolve => {
       const timer = setTimeout(resolve, 5000);
       child.once('close', () => {

@@ -5,12 +5,24 @@ const crypto = require('node:crypto');
 const key = file => path.resolve(file).toLowerCase();
 const inside = (file, dir) => key(file) === key(dir) || key(file).startsWith(key(dir) + path.sep);
 const fingerprint = stat => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+const highRisk = file =>
+  /\.(exe|dll|msi|msp|msix|zip|7z|rar|iso|bat|cmd|ps1|vbs|js|jse|scr|com|hta|lnk|jar)$/i.test(file);
 
 // All queue mutations occur in the background process. In-flight entries stay persisted until their
 // verdict and outbox event have been saved, so an abrupt stop simply retries them on the next start.
 class MonitorQueue {
-  constructor({ prefs, folders, exclusions, scan, save = () => {}, emit = () => {}, state = {}, now = Date.now }) {
-    Object.assign(this, { prefs, folders, exclusions, scan, save, emit, now });
+  constructor({
+    prefs,
+    folders,
+    exclusions,
+    scan,
+    onThreat = async () => {},
+    save = () => {},
+    emit = () => {},
+    state = {},
+    now = Date.now
+  }) {
+    Object.assign(this, { prefs, folders, exclusions, scan, onThreat, save, emit, now });
     this.pending = new Map((state.pending || []).slice(0, prefs.maxQueue).map(e => [key(e.path), e]));
     this.cache = new Map((state.cache || []).slice(-20000));
     this.outbox = state.outbox || [];
@@ -40,6 +52,7 @@ class MonitorQueue {
   enqueue(file, priority = 0) {
     file = path.resolve(file);
     if (!this.allowed(file)) return false;
+    if (this.prefs.highRiskOnly && !highRisk(file)) return false;
     const id = key(file),
       old = this.pending.get(id);
     if (!old && this.pending.size >= this.prefs.maxQueue) {
@@ -140,8 +153,15 @@ class MonitorQueue {
           size: after.size,
           fingerprint: fingerprint(after)
         };
+        Object.assign(event, { sha256: verdict.sha256, engine: verdict.engine, action: verdict.action || 'review' });
         this.outbox.push(event);
         this.metrics.detections++;
+        this.persist(); // Durably announce the detection before any quarantine mutation.
+        try {
+          await this.onThreat(event);
+        } catch (err) {
+          event.quarantineError = err.message;
+        }
       }
       this.metrics.scanned++;
       this.recent = this.recent.filter(e => e.path !== entry.path);
@@ -192,4 +212,4 @@ class MonitorQueue {
   }
 }
 
-module.exports = { MonitorQueue, fingerprint, inside };
+module.exports = { MonitorQueue, fingerprint, inside, highRisk };

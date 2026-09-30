@@ -331,7 +331,7 @@ function overview() {
     `<div class="bottom-grid">
       <section class="card panel">
         <div class="panel-top"><h2>Health checks</h2></div>
-        <p class="muted">Scheduled and on-demand scanning. Real-time file monitoring is not included.</p>
+        <p class="muted">Scheduled, on-demand and continuous file scanning. User-space monitoring cannot prevent a file from executing.</p>
         ${healthChecks()}
       </section>
       <section class="card panel">
@@ -694,8 +694,14 @@ function monitorSection() {
     `<div class="setting-row"><label for="monitor-${key}">${label}</label><input id="monitor-${key}" type="number" data-monitor="${key}" min="${min}" max="${max}" step="${step}" value="${m[key]}"></div>`;
   return `<section class="card panel">
     <h2>Continuous scanning & resources</h2>
-    <p>Checks new and changed files after they settle. Monitoring continues when Sentinel exits; it does not block files from running. Keep your primary antivirus enabled.</p>
-    ${toggle('enabled', 'Monitor file changes', 'Uses one persistent ClamAV engine. When enabled without folders, your quick-scan folders are selected.')}
+    <p>Checks new and changed files after they settle. This does not block files from running. Keep your primary antivirus enabled.</p>
+    ${toggle('enabled', 'Monitor file changes', 'Uses one persistent ClamAV engine. Defaults to Downloads and user/system Temp folders.')}
+    ${toggle('highRiskOnly', 'Focus on executables, scripts and archives', 'Includes EXE, MSI, ZIP, BAT and PowerShell files. Turn off to scan every file type.')}
+    ${toggle('autoQuarantine', 'Automatically quarantine confirmed threats', 'Moves hash-verified ClamAV threats into an isolated vault. Heuristic and community-rule matches require review.')}
+    ${toggle('yaraEnabled', 'YARA community detection', 'Adds a curated Signature Base feed. Rules update every six hours and retain author attribution. Matches require review.')}
+    ${toggle('staticAnalysis', 'Inspect executable structure', 'Radare2 checks PE sections and imports. Structural anomalies are review alerts, not proof of malware.')}
+    ${toggle('telemetryEnabled', 'Local behavior snapshots', 'Uses osquery once per minute to summarize processes and connections and flag Office-launched interpreters. Short-lived activity can be missed.')}
+    ${toggle('keepRunning', 'Continue after quitting Sentinel', 'Keeps the background scanner running. An installed Windows service continues independently of this setting.')}
     <div class="notice"><strong data-live="monitorStatus">${esc(live.monitorStatus())}</strong><p data-live="monitorQueue">${esc(live.monitorQueue())}</p><p data-live="monitorResources">${esc(live.monitorResources())}</p><p data-live="monitorCounts">${esc(live.monitorCounts())}</p><p data-live="monitorLatency">${esc(live.monitorLatency())}</p></div>
     <div class="row">${btn('Pause 15 minutes', 'monitor-pause', '15', 'small')}${btn('Pause one hour', 'monitor-pause', '60', 'small')}${btn('Resume', 'monitor-pause', '0', 'small')}</div>
     ${toggle('pauseOnBattery', 'Pause on battery', 'Queues changes and releases engine memory until AC power returns.')}
@@ -712,6 +718,7 @@ function monitorSection() {
     <h3>Watched folders</h3><div id="monitor-folders">${monitorFolders()}</div>
     ${btn('Add monitored folder', 'monitor-folder', '', 'small')}
     <h3>Recent monitoring issues</h3><div id="monitor-issues">${monitorIssues()}</div>
+    <div id="analysis-status">${analysisStatus()}</div>
     <p>Save preferences to apply folder and resource changes. Optional service installation instructions are included in the project documentation.</p>
   </section>`;
 }
@@ -722,8 +729,13 @@ function monitorFolders() {
         (folder, i) =>
           `<div class="setting-row"><span class="path">${esc(folder)}</span>${btn('Remove', 'monitor-remove', String(i), 'small')}</div>`
       )
-      .join('') || '<p>Quick-scan folders will be used when monitoring is enabled.</p>'
+      .join('') || '<p>Downloads and user/system Temp folders will be used when monitoring is enabled.</p>'
   );
+}
+function analysisStatus() {
+  const r = state.monitoring?.rules,
+    b = state.monitoring?.behavior;
+  return `<h3>Additional detection layers</h3><p>YARA rules: ${esc(r?.version ? r.version.slice(0, 12) + ' · ' + (r.updated || '') : 'No active feed')}${r?.error ? ' · ' + esc(r.error) : ''}</p><p>Behavior: ${esc(b?.enabled ? b.error || `${b.processes || 0} processes · ${b.connections || 0} connections · sampled ${b.at || 'pending'}` : 'Off')}</p>${(b?.alerts || []).map(a => `<p>${esc(a.message)}: ${esc(a.name)} (PID ${esc(a.pid)})</p>`).join('')}`;
 }
 function monitorIssues() {
   return (
@@ -908,6 +920,8 @@ window.sentinel.subscribe((kind, data) => {
     if (data.detections) patchDetections();
     const issues = document.querySelector('#monitor-issues');
     if (issues) issues.innerHTML = monitorIssues();
+    const analysis = document.querySelector('#analysis-status');
+    if (analysis) analysis.innerHTML = analysisStatus();
     return;
   }
   if (kind === 'progress') {

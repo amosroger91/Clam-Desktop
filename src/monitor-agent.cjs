@@ -12,6 +12,10 @@ const databaseInfo = require('./database.cjs');
 const rpc = require('./monitor-rpc.cjs');
 const { updateDefinitions } = require('./monitor-update.cjs');
 const { queueSpec } = require('./monitor-state.cjs');
+const { AnalysisPipeline, findTool } = require('./analysis-tools.cjs');
+const { createRuleFeed } = require('./rule-feed.cjs');
+const { createQuarantine } = require('./quarantine.cjs');
+const { createBehavior } = require('./behavior.cjs');
 
 const plainSpec = fallback => ({
   version: 1,
@@ -56,6 +60,13 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
     updateState = { nextAttempt: 0, failures: 0 },
     databaseFault = null;
   const manual = new Map();
+  let pipeline,
+    rules,
+    behavior,
+    rulesNext = 0,
+    rulesUpdating = null;
+  let autoRecords = [],
+    autoVault;
   let saveTimer;
   let queueState = {},
     durableEvents = 0,
@@ -125,6 +136,16 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
     }
     const oldConfig = config;
     config = normalized;
+    if (next.toolsRoot && (!path.isAbsolute(next.toolsRoot) || /[\r\n\0]/.test(next.toolsRoot)))
+      throw Error('Invalid analysis tools path');
+    rules = createRuleFeed(path.join(dir, 'rules'), findTool(next.toolsRoot, 'yr.exe'));
+    behavior = createBehavior(next.toolsRoot);
+    pipeline = new AnalysisPipeline({
+      toolsRoot: next.toolsRoot,
+      rules,
+      prefs,
+      clam: { scan: (file, options) => engine.scan(file, options) }
+    });
     if (next.verifiedFingerprint && next.verifiedFingerprint === inspectDatabase(next.database).fingerprint)
       databaseFault = null;
     store.save('config', config, 1);
@@ -133,7 +154,15 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
       folders: prefs.folders,
       exclusions: [...next.exclusions, root],
       state: queueState,
-      scan: (file, options) => engine.scan(file, options),
+      scan: (file, options) => pipeline.scan(file, options),
+      onThreat: async event => {
+        if (prefs.autoQuarantine && event.action === 'quarantine' && event.sha256) {
+          if (autoRecords.length >= 500)
+            throw Error('Automatic quarantine record limit reached; review existing records');
+          const record = await autoVault.quarantine(event);
+          event.quarantineStatus = record.status;
+        }
+      },
       save: persist,
       emit: () => setImmediate(tick)
     });
@@ -141,7 +170,10 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
       oldConfig &&
       (oldConfig.scanArchives !== config.scanArchives ||
         oldConfig.detectPUA !== config.detectPUA ||
-        oldConfig.prefs.maxFileMB !== config.prefs.maxFileMB)
+        oldConfig.prefs.maxFileMB !== config.prefs.maxFileMB ||
+        oldConfig.prefs.yaraEnabled !== prefs.yaraEnabled ||
+        oldConfig.prefs.staticAnalysis !== prefs.staticAnalysis ||
+        oldConfig.prefs.highRiskOnly !== prefs.highRiskOnly)
     )
       queue.cache.clear();
     watcher = prefs.enabled ? watchFolders(queue, { onError: (file, err) => queue.note(file, err.message) }) : null;
@@ -181,8 +213,11 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
       ...queue?.status(),
       events: queue?.outbox.slice(0, 100) || [],
       folders: config?.prefs.folders || [],
-      definitionVersion: queue?.databaseVersion,
-      service: process.env.SENTINEL_SERVICE === '1'
+      definitionVersion: engineKey,
+      service: process.env.SENTINEL_SERVICE === '1',
+      quarantine: autoRecords.slice(0, 500),
+      rules: rules?.status(),
+      behavior: behavior?.status()
     };
   }
   // Mutating commands are serialized so pause/configure cannot race engine startup or each other.
@@ -245,6 +280,13 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
         flush();
         return true;
       }
+      if (action === 'auto-restore' || action === 'auto-recheck' || action === 'auto-resolve') {
+        if (leaseUntil <= Date.now()) throw Error('A desktop maintenance lease is required');
+        if (typeof payload?.id !== 'string') throw Error('Invalid quarantine request');
+        if (action === 'auto-restore') return autoVault.restore(payload.id, payload.target);
+        if (action === 'auto-recheck') return autoVault.recheck(payload.id);
+        return autoVault.resolve(payload.id, payload.action);
+      }
       if (action === 'lease') {
         if (typeof payload?.id !== 'string') throw Error('Invalid maintenance lease');
         if (leaseUntil > Date.now() && leaseId !== payload.id)
@@ -280,6 +322,17 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
   // Binding precedes reading/writing state: only one agent per profile may own the durable queue.
   server.listen(rpc.address(root));
   await once(server, 'listening');
+  const vaultFolder = path.join(dir, 'quarantine');
+  fs.mkdirSync(vaultFolder, { recursive: true, mode: 0o700 });
+  const vaultState = store.load('quarantine', require('./schemas.cjs').quarantine);
+  autoRecords = vaultState.value;
+  if (vaultState.issue) fault = vaultState.issue.message;
+  autoVault = createQuarantine({
+    vault: vaultFolder,
+    records: autoRecords,
+    persist: () => store.save('quarantine', autoRecords, 1)
+  });
+  await autoVault.recover();
   const persisted = store.load('queue', queueSpec);
   if (persisted.issue) fault = persisted.issue.message;
   queueState = persisted.value;
@@ -287,6 +340,7 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
     'updates',
     plainSpec(() => ({ nextAttempt: 0, failures: 0 }))
   ).value;
+  databaseFault = typeof updateState.databaseFault === 'string' ? updateState.databaseFault : null;
   const loaded = store.load(
     'config',
     plainSpec(() => null)
@@ -303,6 +357,32 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
       }
       await commands;
       if (!config || !queue) return;
+      if (
+        !config.prefs.keepRunning &&
+        process.env.SENTINEL_SERVICE !== '1' &&
+        session &&
+        Date.now() - session.at > 90000
+      ) {
+        await shutdown();
+        return;
+      }
+      if (config.prefs.telemetryEnabled && !status().reason) behavior.tick(true).catch(() => {});
+      if (config.prefs.yaraEnabled && !rulesUpdating && Date.now() >= rulesNext) {
+        rulesNext = Date.now() + 6 * 3600000;
+        const updatingRules = rules;
+        rulesUpdating = updatingRules
+          .update()
+          .then(
+            () => {
+              queue.cache.clear();
+              queue.reconcileNeeded = true;
+            },
+            err => queue.note('YARA feed', err.message)
+          )
+          .finally(() => {
+            rulesUpdating = null;
+          });
+      }
       if (
         !updater &&
         config.prefs.enabled &&
@@ -340,6 +420,7 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
           )
           .finally(() => {
             if (updater === work) updater = null;
+            updateState.databaseFault = databaseFault;
             store.save('updates', updateState, 1);
             setImmediate(tick);
           });
@@ -358,6 +439,7 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
         queue.databaseVersion = key;
         queue.reconcileNeeded = true;
       }
+      queue.databaseVersion = key + '|' + (config.prefs.yaraEnabled ? rules.active()?.version || 'unavailable' : 'off');
       if (Date.now() < retryAt) return;
       if (!engine)
         engine = new Clamd({
@@ -381,7 +463,7 @@ async function run(root, { inspectDatabase = databaseInfo.inspect, sampleResourc
         if (next) {
           const [id, job] = next;
           job.running = true;
-          startingEngine
+          pipeline
             .scan(job.file, { signal: job.abort.signal })
             .then(job.resolve, job.reject)
             .finally(() => {

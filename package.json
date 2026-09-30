@@ -1,6 +1,6 @@
 {
   "name": "sentinel-av",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "A considered Windows desktop companion for ClamAV",
   "author": "WellSpring Studio",
   "license": "MIT",
@@ -12,8 +12,9 @@
     "test:integration": "node scripts/integration.cjs",
     "test:monitor": "node scripts/test-monitor-integration.cjs",
     "build:service": "powershell -NoProfile -File scripts/build-service.ps1",
-    "pack": "npm run build:service && electron-builder --win --dir",
-    "dist": "npm run build:service && electron-builder --win nsis",
+    "prepare:tools": "node scripts/prepare-tools.cjs",
+    "pack": "npm run prepare:tools && npm run build:service && electron-builder --win --dir",
+    "dist": "node scripts/check-signing.cjs && npm run prepare:tools && npm run build:service && electron-builder --win nsis --publish never",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test:smoke": "node scripts/smoke.cjs"
@@ -25,6 +26,25 @@
   },
   "build": {
     "extraResources": [
+      {
+        "from": "vendor",
+        "to": "engines",
+        "filter": [
+          "**/*",
+          "!**/*.zip",
+          "!**/*.pdb",
+          "!**/*.lib",
+          "!**/osqueryd/**"
+        ]
+      },
+      {
+        "from": "config/clamd.conf",
+        "to": "engines/clamav/clamd.conf.template"
+      },
+      {
+        "from": "THIRD-PARTY-NOTICES.md",
+        "to": "engines/THIRD-PARTY-NOTICES.md"
+      },
       {
         "from": "src",
         "to": "monitor/src",
@@ -61,7 +81,7 @@
     "win": {
       "target": "nsis",
       "icon": "assets/icon.ico",
-      "signExecutable": false
+      "signExecutable": true
     },
     "nsis": {
       "oneClick": false,
