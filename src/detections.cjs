@@ -22,6 +22,9 @@ function audit(d, at, action, detail = null) {
 
 // Records one sighting from a scan. Returns the detection it was merged into or created.
 function observe(detections, { path, signature, reportId, at, id = crypto.randomUUID() }) {
+  // A live detection may have been reviewed before its scan commits or replays.
+  const recorded = detections.find(d => d.id === id);
+  if (recorded) return recorded;
   const existing = detections.find(d => isUnresolved(d) && key(d.path, d.signature) === key(path, signature));
   if (existing) {
     // Replaying the same scan's sighting (for example after a crash) is a no-op.

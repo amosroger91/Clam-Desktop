@@ -19,6 +19,7 @@ function defaults() {
     autoUpdate: true,
     scanArchives: true,
     detectPUA: false,
+    monitoring: require('./monitor-settings.cjs').defaults(),
     // Definitions older than this are reported as outdated.
     staleAfterDays: 3,
     exclusions: [],
@@ -53,6 +54,8 @@ function validateSettings(input, previous) {
   if (!Number.isInteger(input.staleAfterDays) || input.staleAfterDays < 1 || input.staleAfterDays > 30)
     throw Error('Choose how many days definitions stay current (1–30).');
   out.staleAfterDays = input.staleAfterDays;
+  if (input.monitoring !== undefined)
+    out.monitoring = require('./monitor-settings.cjs').validate(input.monitoring, previous.monitoring);
   return out;
 }
 function scanArgs(settings, database, targets) {

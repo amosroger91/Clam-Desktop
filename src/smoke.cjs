@@ -21,6 +21,8 @@ async function checkRenderer(win) {
     const prefs = (await window.sentinel.call('state')).data.settings;
     prefs.notifications = false;
     const saved = await window.sentinel.call('settings', prefs);
+    const invalidMonitoring = await window.sentinel.call('settings', { ...prefs, monitoring: { ...prefs.monitoring, concurrency: 99 } });
+    const resourceControls = ['concurrency', 'maxFileMB', 'maxQueue', 'minFreeMemoryMB', 'maxCpuPercent', 'settleMs'].every(key => document.querySelector('[data-monitor="' + key + '"]'));
     const invalid = await window.sentinel.call('scan', 'injected-type');
     // Unsaved edits are not discarded silently: navigating away asks first, and Discard then proceeds.
     document.querySelector('nav [data-value="settings"]').click();
@@ -30,11 +32,13 @@ async function checkRenderer(win) {
     document.querySelector('[data-action="unsaved-discard"]').click();
     const discarded = document.querySelector('h1').textContent === 'Security overview';
     const badge = document.querySelector('#health-badge').textContent;
-    return { results, saved: saved.ok, rejectedInvalidScan: !invalid.ok, unsavedGuard: guarded && discarded, badge };
+    return { results, saved: saved.ok, rejectedInvalidScan: !invalid.ok, rejectedInvalidMonitoring: !invalidMonitoring.ok, resourceControls, unsavedGuard: guarded && discarded, badge };
   })()`);
   write('screens.json', JSON.stringify(screens, null, 2));
   if (
     !screens.saved ||
+    !screens.resourceControls ||
+    !screens.rejectedInvalidMonitoring ||
     !screens.rejectedInvalidScan ||
     !screens.unsavedGuard ||
     !screens.badge ||
@@ -94,6 +98,15 @@ async function checkHealthyState(app) {
 async function checkEngine(app) {
   if (!(await prepareEngine(app))) return;
   await checkHealthyState(app);
+  let rejectedEmpty = false;
+  try {
+    await app.scan('custom', []);
+  } catch (err) {
+    rejectedEmpty = /No scan locations/.test(err.message);
+  }
+  if (!rejectedEmpty || app.isScanning() || app.latestReport()?.status !== 'error')
+    throw Error('A failed scan preparation did not release its operation and save its report.');
+  console.log('Scan preparation failure is recorded and releases the operation.');
   await app.scan('custom', [path.join(testRoot, 'fixtures')]);
   const deadline = Date.now() + 180000;
   while (app.isScanning() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 100));

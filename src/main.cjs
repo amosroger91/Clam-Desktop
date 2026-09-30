@@ -12,6 +12,8 @@ const scheduler = require('./scheduler.cjs');
 const detectionStore = require('./detections.cjs');
 const { createQuarantine } = require('./quarantine.cjs');
 const { startScan, reportStatus } = require('./scanner.cjs');
+const { startDaemonScan } = require('./daemon-scan.cjs');
+const { createClient } = require('./monitor-client.cjs');
 const databaseInfo = require('./database.cjs');
 const { assess, capability, classifyUpdateFailure } = require('./health.cjs');
 const { identify } = require('./files.cjs');
@@ -52,6 +54,108 @@ if (!app.requestSingleInstanceLock()) {
   const icon = path.join(__dirname, '../assets/icon.png');
   const store = createStore(root);
   const journal = createJournal(path.join(root, 'journal'));
+  const monitor = createClient(
+    root,
+    app.isPackaged
+      ? {
+          agent: path.join(process.resourcesPath, 'monitor/src/monitor-agent.cjs'),
+          host: path.join(process.resourcesPath, 'monitor/SentinelMonitor.exe')
+        }
+      : {
+          host: fs.existsSync(path.join(__dirname, '../service/SentinelMonitor.exe'))
+            ? path.join(__dirname, '../service/SentinelMonitor.exe')
+            : undefined
+        }
+  );
+  let monitoring = { connected: false, reason: 'Monitoring is off' },
+    monitorTimer,
+    monitorPolling = false;
+  let monitorConfig = '';
+
+  async function configureMonitor() {
+    if (smoke || !engine.installed) return;
+    if (!settings.monitoring.enabled && !monitor.connected()) return;
+    const config = {
+      prefs: settings.monitoring,
+      engineDir: engine.dir,
+      database: db,
+      exclusions: settings.exclusions,
+      scanArchives: settings.scanArchives,
+      detectPUA: settings.detectPUA,
+      autoUpdate: settings.autoUpdate,
+      verifiedFingerprint: database.verified === true ? database.fingerprint : null,
+      blocked: !ready()
+    };
+    const signature = JSON.stringify(config);
+    if (signature === monitorConfig) return;
+    monitoring = await monitor.configure(config);
+    monitorConfig = signature;
+  }
+  async function pollMonitor() {
+    if (monitorPolling || shuttingDown || smoke) return;
+    monitorPolling = true;
+    try {
+      await configureMonitor();
+      if (!monitor.connected()) return;
+      const next = await monitor.call('status', { idleSeconds: powerMonitor.getSystemIdleTime() });
+      for (const event of next.events || []) {
+        // Persist through the existing journal/replay path before acknowledging the worker's outbox.
+        const header = { reportId: event.id, kind: 'custom', started: event.at, options: { continuous: true } };
+        const evidence = { eventId: event.id, path: event.path, signature: event.signature, at: event.at };
+        const outcome = {
+          status: 'completed',
+          finished: event.at,
+          files: 1,
+          warnings: [],
+          warningCount: 0,
+          exitCode: 1,
+          targets: [event.path],
+          continuous: true
+        };
+        if (!journal.list().includes(event.id)) {
+          const writer = journal.begin(event.id, header);
+          try {
+            writer.append('detection', evidence);
+            writer.append('commit', { outcome });
+          } finally {
+            writer.close();
+          }
+        }
+        const view = stateView();
+        applyScan(view, { header, targets: [event.path], detections: [evidence], commit: outcome }, new Date());
+        adopt(view);
+        persist(...SAVE_ORDER);
+        journal.remove(event.id);
+        await monitor.call('ack', [event.id]);
+        notify('Threat detected', event.signature + '\n' + event.path);
+      }
+      if (next.events?.length) {
+        identifyDetections();
+        publish(true);
+      }
+      if (next.definitionVersion && next.definitionVersion !== database.fingerprint) refreshDatabase();
+      delete next.events;
+      monitoring = next;
+      withWindow(w => w.webContents.send('monitor', { monitoring, health: health() }));
+      if (tray && !tray.isDestroyed()) tray.setToolTip(health().tooltip);
+    } catch (err) {
+      monitoring = { ...monitoring, connected: false, reason: err.message };
+      monitorConfig = '';
+      withWindow(w => w.webContents.send('monitor', { monitoring, health: health() }));
+    } finally {
+      monitorPolling = false;
+    }
+  }
+  async function withMonitorPaused(fn) {
+    if (!monitor.connected()) return fn();
+    await monitor.ensure();
+    await monitor.acquire();
+    try {
+      return await fn();
+    } finally {
+      await monitor.release();
+    }
+  }
 
   // ---- State ----
   // Persisted
@@ -218,7 +322,7 @@ if (!app.requestSingleInstanceLock()) {
 
   // ---- Publishing state ----
   function lastScanSummaries() {
-    return { lastScan: reports[0] || null, lastSuccessfulScan: jobs.lastSuccessfulScan };
+    return { lastScan: reports.find(r => !r.options?.continuous) || null, lastSuccessfulScan: jobs.lastSuccessfulScan };
   }
   function health() {
     const now = new Date();
@@ -238,7 +342,8 @@ if (!app.requestSingleInstanceLock()) {
       lastScan,
       unresolved: detections.filter(detectionStore.isUnresolved).length,
       quarantineReview: quarantineRecords.filter(q => q.status === 'recovery-needed').length,
-      storageIssues: storageIssues.length
+      storageIssues: storageIssues.length,
+      monitoring
     });
   }
   function state() {
@@ -254,6 +359,7 @@ if (!app.requestSingleInstanceLock()) {
       updates,
       database: { ...database, files: undefined },
       engine,
+      monitoring,
       health: health(),
       active,
       operations: operations.active(),
@@ -453,7 +559,8 @@ if (!app.requestSingleInstanceLock()) {
   }
   // `owned` is set when an install already holds the operation that covers this update.
   function updateSignatures({ owned = false } = {}) {
-    return owned ? runUpdate() : operations.run('update', 'Updating definitions', runUpdate);
+    const updateSafely = () => withMonitorPaused(runUpdate);
+    return owned ? updateSafely() : operations.run('update', 'Updating definitions', updateSafely);
   }
   async function runUpdate() {
     if (!engine.installed) throw Error('Set up ClamAV in Settings first.');
@@ -627,8 +734,9 @@ if (!app.requestSingleInstanceLock()) {
     activeScan = { control, handle: null, done: new Promise(resolve => (finished = resolve)) };
     publish(true);
 
+    let scanProgressTimer;
     const complete = result => {
-      clearInterval(progressTimer);
+      clearInterval(scanProgressTimer);
       finishScan(report, result, evidence);
       finished();
     };
@@ -658,13 +766,34 @@ if (!app.requestSingleInstanceLock()) {
       evidence.failure = err.message;
     }
     // Periodic progress lets an interrupted report keep a meaningful file count.
-    const progressTimer = setInterval(() => {
+    scanProgressTimer = setInterval(() => {
       try {
         writer.append('progress', { files: report.files });
       } catch {}
     }, 30000);
     let handle;
-    handle = startScan({
+    const daemonMode = settings.monitoring.enabled && !smoke;
+    if (daemonMode) {
+      try {
+        await configureMonitor();
+      } catch (err) {
+        complete({
+          exitCode: null,
+          error: err.message,
+          files: 0,
+          threats: [],
+          warnings: [err.message],
+          warningCount: 1
+        });
+        err.recorded = true;
+        throw err;
+      }
+    }
+    const launchScan = daemonMode ? startDaemonScan : startScan;
+    handle = launchScan({
+      targets,
+      exclusions: settings.exclusions,
+      client: monitor,
       exe: path.join(engine.dir, 'clamscan.exe'),
       args: scanArgs(settings, db, targets),
       logPath: path.join(scanLogs, report.id + '.log'),
@@ -683,6 +812,9 @@ if (!app.requestSingleInstanceLock()) {
           writer.append('detection', event);
           evidence.detections.push(event);
           report.threatCount = evidence.detections.length;
+          detectionStore.observe(detections, { ...event, id: event.eventId, reportId: report.id });
+          publish(true);
+          notify('Threat detected', threat.signature + '\n' + threat.path, 'scan-' + report.id);
           // Smoke crash scenario: die abruptly once evidence is durable, before the scan can commit.
           if (smokeMode === 'crash-start') process.exit(0);
         } catch (err) {
@@ -847,7 +979,12 @@ if (!app.requestSingleInstanceLock()) {
       if (scheduler.advance(settings.schedules, scheduleRuntime, now)) persistQuietly('schedule');
       if (!engine.runnable) return;
       const job = scheduler.nextJob(settings.schedules, scheduleRuntime, now);
-      if (job && ready() && !operations.conflictsWith('scan')) {
+      if (
+        job &&
+        ready() &&
+        !operations.conflictsWith('scan') &&
+        (!settings.monitoring.enabled || (monitoring.connected && !monitoring.reason))
+      ) {
         job.started = now.toISOString();
         scheduler.recordStart(scheduleRuntime, job, now);
         try {
@@ -913,22 +1050,26 @@ if (!app.requestSingleInstanceLock()) {
   }
 
   async function quarantineDetection(id) {
-    assertFileOperationAllowed();
     const d = detections.find(x => x.id === id);
     if (!d || d.status !== 'detected') throw Error('This detection is no longer awaiting review.');
     const response = await confirm({
-      buttons: ['Cancel', 'Quarantine file'],
+      buttons: ['Cancel', activeScan ? 'Stop scan and quarantine' : 'Quarantine file'],
       title: 'Quarantine detected file?',
       message: d.signature,
       detail: d.path + '\n\nThis moves the file to Sentinel’s quarantine. Programs using it may stop working.'
     });
     if (response !== 1) return;
+    if (activeScan) {
+      const done = activeScan.done;
+      cancelScan('user');
+      await done;
+    }
     // Permission is acquired after the dialog and the detection re-checked, since a scan may have started
     // or the detection changed while the dialog was open (R08.3).
     const op = operations.begin('file', 'Quarantining a file');
     try {
       if (d.status !== 'detected') throw Error('This detection is no longer awaiting review.');
-      const record = await quarantine.quarantine(d);
+      const record = await withMonitorPaused(() => quarantine.quarantine(d));
       if (record.saveError) notify('Quarantine completed, but was not saved', record.saveError);
       if (record.status === 'recovery-needed')
         notify('Quarantine needs your review', record.issue || 'Open Quarantine in Sentinel to decide what to keep.');
@@ -969,7 +1110,7 @@ if (!app.requestSingleInstanceLock()) {
       target = chosen.filePath;
     }
     try {
-      await operations.run('file', 'Restoring a file', () => quarantine.restore(id, target));
+      await operations.run('file', 'Restoring a file', () => withMonitorPaused(() => quarantine.restore(id, target)));
     } finally {
       publish(true);
     }
@@ -991,7 +1132,9 @@ if (!app.requestSingleInstanceLock()) {
       if (response !== 1) return;
     }
     try {
-      await operations.run('file', 'Resolving a quarantine review', () => quarantine.resolve(id, action));
+      await operations.run('file', 'Resolving a quarantine review', () =>
+        withMonitorPaused(() => quarantine.resolve(id, action))
+      );
     } finally {
       publish(true);
     }
@@ -1055,6 +1198,7 @@ if (!app.requestSingleInstanceLock()) {
     shuttingDown = true;
     operations.close(); // no new operation is accepted from here on
     clearInterval(tickTimer);
+    clearInterval(monitorTimer);
     const waits = [];
     if (activeScan) {
       cancelScan('shutdown');
@@ -1234,7 +1378,7 @@ if (!app.requestSingleInstanceLock()) {
         if (!selected.canceled) return scan('custom', selected.filePaths);
       },
       cancel: () => cancelScan('user'),
-      settings: payload => {
+      settings: async payload => {
         const next = validateSettings(payload, settings);
         if (next.launchAtLogin !== settings.launchAtLogin) {
           if (!app.isPackaged) throw Error('Install the packaged app to enable launch at sign-in.');
@@ -1243,6 +1387,10 @@ if (!app.requestSingleInstanceLock()) {
         const runtime = scheduler.reconcile(next.schedules, scheduleRuntime, new Date());
         store.save('settings', next, SPECS.settings.version);
         settings = next;
+        if (settings.monitoring.enabled && !settings.monitoring.folders.length)
+          settings.monitoring.folders = quickTargets();
+        persist('settings');
+        await configureMonitor();
         scheduleRuntime = runtime;
         persistQuietly('schedule');
         publish(true);
@@ -1279,6 +1427,20 @@ if (!app.requestSingleInstanceLock()) {
         publish(true);
       },
       update: () => updateSignatures(),
+      'monitor-folder': async () => {
+        const selected = await dialog.showOpenDialog(dialogParent(), {
+          title: 'Monitor a folder',
+          properties: ['openDirectory']
+        });
+        return selected.canceled ? null : selected.filePaths[0];
+      },
+      'monitor-pause': async minutes => {
+        if (![0, 15, 60].includes(minutes)) throw Error('Choose resume, 15 minutes, or one hour.');
+        settings.monitoring.pauseUntil = minutes ? new Date(Date.now() + minutes * 60000).toISOString() : null;
+        persist('settings');
+        await configureMonitor();
+        publish(true);
+      },
       download: () => shell.openExternal('https://www.clamav.net/downloads'),
       quarantine: id => quarantineDetection(id),
       restore: id => restoreRecord(id),
@@ -1339,6 +1501,10 @@ if (!app.requestSingleInstanceLock()) {
 
     await win.loadFile(path.join(__dirname, '../ui/index.html'));
     await detectEngine();
+    if (!smoke) {
+      pollMonitor();
+      monitorTimer = setInterval(pollMonitor, 2000);
+    }
     quarantine
       .recover()
       .then(changed => {

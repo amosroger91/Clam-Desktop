@@ -134,7 +134,7 @@ function applyScan(state, replay, now) {
     );
   const success = report.status === 'completed' || report.status === 'partial';
   const last = state.jobs.lastSuccessfulScan;
-  if (success && (!last || last.finished <= report.finished))
+  if (success && !h.options?.continuous && (!last || last.finished <= report.finished))
     state.jobs.lastSuccessfulScan = {
       id: report.id,
       kind: report.kind,

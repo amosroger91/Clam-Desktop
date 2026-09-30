@@ -19,6 +19,17 @@ jobs:
         run: npm run format:check
       - name: Unit tests
         run: npm test
+      - name: Prepare verified ClamAV engine (synthetic signatures only)
+        run: node scripts/prepare-monitor-fixtures.cjs
+      - name: Real ClamAV exit codes
+        run: npm run test:integration
+      - name: Build background process host
+        run: npm run build:service
+      - name: Continuous scanning and restart recovery
+        shell: pwsh
+        run: |
+          $env:SENTINEL_TEST_HOST = Join-Path $PWD 'service/SentinelMonitor.exe'
+          npm run test:monitor
       # Renderer, IPC validation, fatal-fault handling, and failure propagation. The real-engine
       # scenarios skip with a visible note because CI has no prepared ClamAV fixtures.
       - name: Electron smoke scenarios

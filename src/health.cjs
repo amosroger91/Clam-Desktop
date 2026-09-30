@@ -63,6 +63,20 @@ function assess(input) {
   const cap = capability({ engine, database, now, settings });
   const checks = [];
   const add = (id, status, label, detail = '', action = null) => checks.push({ id, status, label, detail, action });
+  if (settings.monitoring?.enabled) {
+    const m = input.monitoring;
+    if (!m?.connected) add('monitor', 'warn', 'Continuous scanning is disconnected', m?.reason || '', 'settings');
+    else if (m.reason) add('monitor', 'warn', 'Continuous scanning is paused or starting', m.reason, 'settings');
+    else add('monitor', 'ok', 'Continuous scanning is running', `${m.queued || 0} files waiting`);
+    if (m?.recent?.length)
+      add(
+        'monitor-coverage',
+        'warn',
+        'Some monitored files need attention',
+        'Review monitoring limits and recent errors in Settings.',
+        'settings'
+      );
+  }
 
   // Engine
   if (!engine.installed) add('engine', 'error', 'ClamAV is not installed', '', 'settings');

@@ -130,7 +130,21 @@ const live = {
     state.active ? phaseText[state.active.status === 'cancelling' ? 'cancelling' : state.active.phase] || '' : '',
   current: () => state.active?.current ?? '',
   installOutput: () => state.installOutput || 'Starting…',
-  updateOutput: () => state.updateOutput
+  updateOutput: () => state.updateOutput,
+  monitorStatus: () =>
+    state.monitoring?.connected
+      ? state.monitoring.reason || 'Monitoring files'
+      : state.monitoring?.reason || 'Disconnected',
+  monitorQueue: () =>
+    `${state.monitoring?.queued || 0} queued · ${state.monitoring?.active || 0} scanning · oldest ${state.monitoring?.oldestSeconds || 0}s`,
+  monitorResources: () =>
+    `${state.monitoring?.resources?.engineMB || 0} MB engine memory · ${state.monitoring?.resources?.freeMB || 0} MB system memory available · system CPU ${state.monitoring?.resources?.cpuPercent ?? '…'}%`,
+  monitorCounts: () =>
+    `${state.monitoring?.metrics?.scanned || 0} checked · ${state.monitoring?.metrics?.skipped || 0} skipped · ${state.monitoring?.metrics?.errors || 0} retry attempts`,
+  monitorLatency: () =>
+    state.monitoring?.p95Ms == null
+      ? 'Waiting for measurements'
+      : `95% of the last 100 verdicts within ${(state.monitoring.p95Ms / 1000).toFixed(1)}s of queueing`
 };
 function patch() {
   for (const el of document.querySelectorAll('[data-live]')) {
@@ -428,7 +442,12 @@ function reviewQueue() {
               ${
                 d.status === 'missing'
                   ? btn('Mark resolved', 'resolve-detection', d.id, 'small')
-                  : btn('Quarantine file', 'quarantine', d.id, 'small danger', !!state.active)
+                  : btn(
+                      state.active ? 'Stop scan and quarantine' : 'Quarantine file',
+                      'quarantine',
+                      d.id,
+                      'small danger'
+                    )
               }
             </div>`
         )
@@ -460,7 +479,7 @@ function historyItem(h) {
     <details class="history-item">
       <summary>
         <div>
-          <strong>${labels[h.kind]} ${h.scheduled ? '· scheduled' : ''}</strong>
+          <strong>${h.options?.continuous ? 'Continuous scan' : labels[h.kind]} ${h.scheduled ? '· scheduled' : ''}</strong>
           <small>${date(h.finished)} · ${h.files.toLocaleString()} files · ${h.threats.length} detections${warnings ? ` · ${warnings} warnings` : ''}</small>
         </div>
         ${pill(h.status, tone)}
@@ -500,7 +519,7 @@ function activity() {
       'The details behind every scan, in one place.',
       btn('Open scan logs', 'logs', '', '', false, 'folder')
     ) +
-    `<div class="stack">${reviewQueue()}<section class="card panel"><div class="panel-top"><h2>Scan reports</h2><span class="muted">The latest 200 reports are kept</span></div>${body}</section></div>`
+    `<div class="stack"><div id="live-review">${reviewQueue()}</div><section class="card panel"><div class="panel-top"><h2>Scan reports</h2><span class="muted">The latest 200 reports are kept</span></div>${body}</section></div>`
   );
 }
 
@@ -644,6 +663,7 @@ function settings() {
     heading('Settings', 'Protection that fits the way you work.', btn('Save preferences', 'save', '', 'primary')) +
     `<div class="stack">
       ${storageNotice()}
+      ${monitorSection()}
       ${engineSection()}
       <section class="card panel">
         <h2>Desktop experience</h2>
@@ -663,6 +683,67 @@ function settings() {
       </section>
     </div>`
   );
+}
+
+function monitorSection() {
+  const m = draft.monitoring;
+  if (!m) return '';
+  const toggle = (key, label, detail) =>
+    `<div class="setting-row"><div><h3>${label}</h3><p>${detail}</p></div><input type="checkbox" class="toggle" data-monitor="${key}" aria-label="${label}" ${m[key] ? 'checked' : ''}></div>`;
+  const number = (key, label, min, max, step = 1) =>
+    `<div class="setting-row"><label for="monitor-${key}">${label}</label><input id="monitor-${key}" type="number" data-monitor="${key}" min="${min}" max="${max}" step="${step}" value="${m[key]}"></div>`;
+  return `<section class="card panel">
+    <h2>Continuous scanning & resources</h2>
+    <p>Checks new and changed files after they settle. Monitoring continues when Sentinel exits; it does not block files from running. Keep your primary antivirus enabled.</p>
+    ${toggle('enabled', 'Monitor file changes', 'Uses one persistent ClamAV engine. When enabled without folders, your quick-scan folders are selected.')}
+    <div class="notice"><strong data-live="monitorStatus">${esc(live.monitorStatus())}</strong><p data-live="monitorQueue">${esc(live.monitorQueue())}</p><p data-live="monitorResources">${esc(live.monitorResources())}</p><p data-live="monitorCounts">${esc(live.monitorCounts())}</p><p data-live="monitorLatency">${esc(live.monitorLatency())}</p></div>
+    <div class="row">${btn('Pause 15 minutes', 'monitor-pause', '15', 'small')}${btn('Pause one hour', 'monitor-pause', '60', 'small')}${btn('Resume', 'monitor-pause', '0', 'small')}</div>
+    ${toggle('pauseOnBattery', 'Pause on battery', 'Queues changes and releases engine memory until AC power returns.')}
+    ${toggle('idleOnly', 'Scan only while idle', 'Waits for the desktop session to report no input. When the desktop is disconnected, work stays queued.')}
+    ${toggle('lowPriority', 'Lower scanner priority', 'Gives other applications scheduling preference. This is not a hard CPU cap.')}
+    ${number('concurrency', 'Concurrent scans', 1, 4)}
+    ${number('maxFileMB', 'Maximum file size (MB)', 1, 1024)}
+    ${number('minFreeMemoryMB', 'Pause below available memory (MB)', 128, 32768)}
+    ${number('maxCpuPercent', 'Pause at system CPU usage (%)', 10, 100)}
+    ${number('maxQueue', 'Maximum queued files', 100, 20000)}
+    ${number('settleMs', 'File settling delay (milliseconds)', 500, 30000, 100)}
+    ${number('idleSeconds', 'Idle time before scanning (seconds)', 30, 3600)}
+    <p>Files over the size limit are reported as skipped. Missed changes and queue overflow are repaired by periodic folder reconciliation.</p>
+    <h3>Watched folders</h3><div id="monitor-folders">${monitorFolders()}</div>
+    ${btn('Add monitored folder', 'monitor-folder', '', 'small')}
+    <h3>Recent monitoring issues</h3><div id="monitor-issues">${monitorIssues()}</div>
+    <p>Save preferences to apply folder and resource changes. Optional service installation instructions are included in the project documentation.</p>
+  </section>`;
+}
+function monitorFolders() {
+  return (
+    (draft.monitoring?.folders || [])
+      .map(
+        (folder, i) =>
+          `<div class="setting-row"><span class="path">${esc(folder)}</span>${btn('Remove', 'monitor-remove', String(i), 'small')}</div>`
+      )
+      .join('') || '<p>Quick-scan folders will be used when monitoring is enabled.</p>'
+  );
+}
+function monitorIssues() {
+  return (
+    (state.monitoring?.recent || [])
+      .map(e => `<p><span class="path">${esc(e.path)}</span> — ${esc(e.message)}</p>`)
+      .join('') || '<p>No recent issues.</p>'
+  );
+}
+function patchDetections() {
+  const container = document.querySelector('#live-review');
+  if (container) {
+    const html = reviewQueue();
+    if (container.innerHTML !== html) container.innerHTML = html;
+  }
+  const nav = document.querySelector('[data-action="navigate"][data-value="activity"]');
+  if (nav) {
+    nav.querySelector('.pill')?.remove();
+    if (unresolved().length)
+      nav.insertAdjacentHTML('beforeend', ` <span class="pill red">${unresolved().length}</span>`);
+  }
 }
 
 const pages = { overview, scans: scanCenter, schedules, quarantine, activity, settings };
@@ -731,6 +812,7 @@ document.addEventListener('toggle', () => stale && renderWhenIdle(), true);
 
 document.addEventListener('change', event => {
   const el = event.target;
+  if (el.dataset.monitor) draft.monitoring[el.dataset.monitor] = el.type === 'checkbox' ? el.checked : Number(el.value);
   if (el.dataset.setting) draft[el.dataset.setting] = el.type === 'checkbox' ? el.checked : Number(el.value);
   if (el.dataset.schedule) {
     const s = draft.schedules.find(s => s.id === el.dataset.schedule);
@@ -751,6 +833,29 @@ document.addEventListener('click', async event => {
   const button = event.target.closest('[data-action]');
   if (!button) return;
   const { action, value } = button.dataset;
+  if (action === 'monitor-folder') {
+    try {
+      const folder = await call('monitor-folder');
+      if (folder) draft.monitoring.folders = [...new Set([...draft.monitoring.folders, folder])];
+    } catch (err) {
+      toast(err.message);
+    }
+    document.querySelector('#monitor-folders').innerHTML = monitorFolders();
+    return;
+  }
+  if (action === 'monitor-remove') {
+    draft.monitoring.folders.splice(Number(value), 1);
+    document.querySelector('#monitor-folders').innerHTML = monitorFolders();
+    return;
+  }
+  if (action === 'monitor-pause') {
+    try {
+      await call('monitor-pause', Number(value));
+    } catch (err) {
+      toast(err.message);
+    }
+    return;
+  }
   if (action === 'navigate') {
     if (value !== current && dirty()) return askAboutUnsavedChanges(value);
     return navigate(value);
@@ -795,6 +900,16 @@ document.addEventListener('click', async event => {
 });
 
 window.sentinel.subscribe((kind, data) => {
+  if (kind === 'monitor') {
+    if (!state) return;
+    Object.assign(state, data);
+    patch();
+    updateHealthBadge();
+    if (data.detections) patchDetections();
+    const issues = document.querySelector('#monitor-issues');
+    if (issues) issues.innerHTML = monitorIssues();
+    return;
+  }
   if (kind === 'progress') {
     if (!state) return;
     Object.assign(state, data);
@@ -804,6 +919,7 @@ window.sentinel.subscribe((kind, data) => {
   state = data;
   if (!draft) draft = structuredClone(state.settings);
   updateHealthBadge();
+  patchDetections();
   renderWhenIdle();
 });
 

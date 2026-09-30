@@ -10,8 +10,10 @@
     "start": "electron .",
     "test": "node --test test/*.test.cjs",
     "test:integration": "node scripts/integration.cjs",
-    "pack": "electron-builder --win --dir",
-    "dist": "electron-builder --win nsis",
+    "test:monitor": "node scripts/test-monitor-integration.cjs",
+    "build:service": "powershell -NoProfile -File scripts/build-service.ps1",
+    "pack": "npm run build:service && electron-builder --win --dir",
+    "dist": "npm run build:service && electron-builder --win nsis",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test:smoke": "node scripts/smoke.cjs"
@@ -22,6 +24,28 @@
     "prettier": "3.9.9"
   },
   "build": {
+    "extraResources": [
+      {
+        "from": "src",
+        "to": "monitor/src",
+        "filter": [
+          "**/*.cjs",
+          "!smoke.cjs"
+        ]
+      },
+      {
+        "from": "service/SentinelMonitor.exe",
+        "to": "monitor/SentinelMonitor.exe"
+      },
+      {
+        "from": "scripts/install-service.ps1",
+        "to": "monitor/install-service.ps1"
+      },
+      {
+        "from": "scripts/uninstall-service.ps1",
+        "to": "monitor/uninstall-service.ps1"
+      }
+    ],
     "appId": "com.wellspring.sentinel",
     "productName": "Sentinel AV",
     "directories": {

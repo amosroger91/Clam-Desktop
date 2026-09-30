@@ -5,11 +5,14 @@ contextBridge.exposeInMainWorld('sentinel', {
   subscribe: callback => {
     const onState = (_, data) => callback('state', data);
     const onProgress = (_, data) => callback('progress', data);
+    const onMonitor = (_, data) => callback('monitor', data);
     ipcRenderer.on('state', onState);
     ipcRenderer.on('progress', onProgress);
+    ipcRenderer.on('monitor', onMonitor);
     return () => {
       ipcRenderer.removeListener('state', onState);
       ipcRenderer.removeListener('progress', onProgress);
+      ipcRenderer.removeListener('monitor', onMonitor);
     };
   }
 });

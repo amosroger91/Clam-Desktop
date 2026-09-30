@@ -74,6 +74,14 @@ const settings = {
       problems = [];
     if (!data || typeof data !== 'object') return { value: base, problems: ['settings were not an object'] };
     const value = { ...base };
+    if (data.monitoring !== undefined) {
+      try {
+        value.monitoring = require('./monitor-settings.cjs').validate(data.monitoring);
+        if (T.optDate(data.monitoring.pauseUntil)) value.monitoring.pauseUntil = data.monitoring.pauseUntil || null;
+      } catch (err) {
+        problems.push(err.message);
+      }
+    }
     for (const key of BOOLEAN_SETTINGS) {
       if (key in data && !T.bool(data[key])) problems.push(`${key} was not true or false`);
       else if (key in data) value[key] = data[key];

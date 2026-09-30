@@ -15,6 +15,7 @@ A Windows desktop companion for the open-source [ClamAV](https://www.clamav.net)
 
 ## What it does
 
+- **Continuous scanning (opt-in):** watches selected folders, queues new/changed files, and scans them through a persistent ClamAV engine. Includes CPU/memory policies, battery and idle controls, timed pauses, backlog/latency statistics, immediate detection alerts, and an optional Windows service. See [continuous scanning and resource management](docs/continuous-scanning.md).
 - **Scheduled scans:** a daily **quick scan** (Desktop, Downloads, Documents, and your temporary folder, including folders Windows has redirected) and a weekly **full scan** of all local fixed drives. You can change the day, time, and frequency, or pause either one. A **custom scan** checks any folder you choose.
 - **Definitions kept current:** checks for new ClamAV definitions hourly, verifies each database file's digital signature with ClamAV's `sigtool`, and warns when definitions are older than the threshold you choose (3 days by default).
 - **An honest dashboard:** the Overview shows "All checks passed" only when a schedule is on, the definitions are current and verified, and your last scan completed. Otherwise it says what needs attention and offers the next useful action. The same status appears in the tray and in the window header.
@@ -22,7 +23,7 @@ A Windows desktop companion for the open-source [ClamAV](https://www.clamav.net)
 - **Careful quarantine and restore:** quarantine confirms it is moving the same file that was detected, and restore never overwrites an existing file (you can restore to another location instead).
 - **Runs in the background:** closing the window keeps Sentinel in the system tray so schedules keep running, and it can start at Windows sign-in.
 
-Sentinel is a **scheduled and on-demand scanner**. It is not a real-time protection driver, a firewall, or a registered Windows Security provider, and it does not disable or replace Microsoft Defender. Scans cannot run while the computer is off or Sentinel is fully closed; a run missed that way happens once Sentinel is running again. ClamAV's file-size and archive limits apply, and scan reports say which locations were fully checked and which had files that could not be read.
+Sentinel provides **scheduled, on-demand, and optional continuous file-change scanning**. It is not a real-time protection driver, a firewall, or a registered Windows Security provider, and it does not disable or replace Microsoft Defender. Continuous monitoring can continue after the desktop exits; desktop notifications are delivered when it is running or reconnects. Scheduled scans require the desktop scheduler; missed runs catch up when it restarts. Nothing runs while the computer is off. ClamAV's file-size and archive limits apply, and scan reports say which locations were fully checked and which had files that could not be read.
 
 ## How it keeps your data safe
 
